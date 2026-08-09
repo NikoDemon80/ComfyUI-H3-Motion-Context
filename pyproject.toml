@@ -1,0 +1,31 @@
+[project]
+name = "comfyui-h3-motion-context"
+description = "Clip chaining for MiniMax H3 in ComfyUI: pin the tail of the previous clip, picture and sound, so the next clip genuinely continues it. Runtime patches only, applied on first use and gated to this pack's own graphs. Node ids MiniMaxH3MotionContext, MiniMaxH3MotionContextTrim, MiniMaxH3MotionContextSaveLatent, MiniMaxH3MotionContextLoadLatent."
+version = "0.2.0"
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "NikoDemon80", email = "262659861+NikoDemon80@users.noreply.github.com" },
+]
+keywords = ["comfyui", "minimax-h3", "video-generation", "audio", "clip-chaining", "video-continuation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+
+[project.urls]
+Homepage = "https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context"
+Repository = "https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context"
+Issues = "https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context/issues"
+
+[tool.comfy]
+PublisherId = "nikodemon80"
+DisplayName = "H3 Motion Context"

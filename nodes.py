@@ -2,7 +2,7 @@
 
 Wire it between a stock H3 conditioning node and the sampler:
 
-    MiniMaxH3ImageToVideo (or the t2v path)
+    MiniMaxH3ImageToVideo / MiniMaxH3ReferenceToVideo (or the t2v path)
         -> H3 Motion Context
         -> guider / sampler
 
@@ -41,8 +41,16 @@ try:
 except ImportError:  # ComfyUI always ships safetensors; belt and braces
     _st_load = _st_save = None
 
-from .patch_layout import MC_KEY, MC_AUDIO_KEY, is_applied
-from .patch_payload import is_applied as payload_patch_applied
+from .patch_layout import (
+    MC_KEY,
+    MC_AUDIO_KEY,
+    apply_patch as _apply_layout_patch,
+    is_applied as _layout_patch_applied,
+)
+from .patch_payload import (
+    apply_patch as _apply_payload_patch,
+    is_applied as _payload_patch_applied,
+)
 
 try:
     import torchaudio
@@ -50,6 +58,45 @@ except ImportError:
     torchaudio = None
 
 _LOG = logging.getLogger("h3_motion_context")
+
+
+def _ensure_layout_patch():
+    """Install the layout patch, once, the first time a node runs.
+
+    ComfyUI imports every folder in custom_nodes at startup, so patching
+    at import time would put this pack's wrappers in the path of every H3
+    graph on the machine, including graphs that never go near these
+    nodes. Installing on first use instead means the pack sitting in
+    custom_nodes changes nothing at all until you actually chain a clip.
+
+    The cost is that a self-test failure shows up on the first render
+    rather than in the startup log. The message is the same either way,
+    and it still refuses rather than rendering something wrong.
+    """
+    if _layout_patch_applied():
+        return
+    if not _apply_layout_patch():
+        raise RuntimeError(
+            "h3_motion_context: the layout patch could not be applied, so "
+            "interior anchors would be rejected by ComfyUI. The reason was "
+            "logged just above this error.")
+
+
+def _ensure_payload_patch():
+    """Install the payload patch, once, before anything needs it.
+
+    Only reached when audio is being pinned, which is the only case where
+    a ref and the keyframes have to coexist.
+    """
+    if _payload_patch_applied():
+        return
+    if not _apply_payload_patch():
+        raise RuntimeError(
+            "h3_motion_context: the payload patch could not be applied. "
+            "Without it the audio ref would overwrite the pinned video "
+            "latents and the motion context would be lost. The reason was "
+            "logged just above this error.")
+
 
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 FPS = 24  # H3's native rate; audio latents run at 40 Hz, hence FRAME_RESCALE 5/3
@@ -64,7 +111,34 @@ AUDIO_HZ = 40.0
 # clip instead of [-5..-1]. The pinned run would end five frames early and the
 # delivered clip would continue from the wrong instant. So off-grid requests
 # are snapped DOWN before slicing, keeping content and coverage in agreement.
-VIDEO_RUN_GRID = (39, 22, 5, 1)
+# The grid is 17m+5 and continues upward; the node only offers up to 56,
+# but the snap-down logic knows the higher points so an out-of-range
+# request lands on the nearest real one instead of being clamped to 39.
+VIDEO_RUN_GRID = (124, 107, 90, 73, 56, 39, 22, 5, 1)
+
+# Settings that used to be widgets. Each had exactly one right answer, so
+# offering the wrong one was noise. The losing branches are still in the
+# code below: change a constant here to reproduce the failure they cause.
+#
+#   ENCODE_MODE   "video" encodes the pinned run in one VAE call, so the
+#                 motion lives inside the latent. "frames" encodes each
+#                 frame as its own still, costs twice the rows and left a
+#                 visible seam in testing.
+#   ANCHOR_MODE   "head" pins the run at the start of the clip, where the
+#                 Trim node removes it. "before" places it at negative
+#                 time so nothing needs trimming, but the coordinates
+#                 collide with the text rows, which weakens the anchors
+#                 and darkens the output.
+#   AUDIO_MODE    "timeline" puts the pinned audio on this clip's own
+#                 timeline so the model continues it. "ref" is the stock
+#                 placement, which the model imitates instead: similar
+#                 music, not the same recording, plus a tick at the join.
+#   CROP          only ever applied when an aspect ratio changed between
+#                 clips, which the resolution check now refuses outright.
+ENCODE_MODE = "video"
+ANCHOR_MODE = "head"
+AUDIO_MODE = "timeline"
+CROP = "disabled"
 
 
 def _pixel_frames(latent_t):
@@ -147,6 +221,68 @@ def _video_from_latent(latent):
     return video
 
 
+def _steps_for_frames(n):
+    """Latent steps covering exactly n pixel frames from cycle position 0.
+
+    Returns None when no whole number of steps covers n. The video VAE's
+    steps alternate 1, 4, 4, 4, 4 pixel frames, so only certain totals are
+    reachable: 1, 5, 9, ... and of the windows this node offers, 5, 22 and
+    39 land on 2, 7 and 12 steps. The 1-frame window does not, because the
+    last step of a clip spans 4 frames, not 1.
+    """
+    k, covered = 0, 0
+    while covered < n:
+        covered += FRAME_PER_TOKEN[k % 5]
+        k += 1
+    return k if covered == n else None
+
+
+def _video_tail_from_latent(latent, n):
+    """Slice the last n pixel frames of video straight out of a generated
+    H3 latent, skipping the h264 decode and the VAE encode.
+
+    Returns (blocks, offsets, covered) in the same shape the encode path
+    produces, so everything downstream is unchanged.
+
+    This is only sound because the tail window always starts at cycle
+    position 0. A clip is 17g+5 frames, which is 5g+2 latent steps; the
+    windows are 2, 7 and 12 steps; and 5g+2 minus any of those is a
+    multiple of 5. So the sliced run has the same 1, 4, 4, 4, 4 phase as a
+    freshly encoded one and _step_offsets applies unchanged. Asserted
+    below rather than assumed, because if it ever stopped holding the
+    pinned content would silently disagree with the positions written for
+    it and the join would land at the wrong instant.
+    """
+    video = _video_from_latent(latent)
+    total = int(video.shape[2])
+    steps = _steps_for_frames(n)
+    if steps is None:
+        raise ValueError(
+            "h3_motion_context: a %d frame window is not a whole number of "
+            "latent steps, so it cannot be sliced from a latent. Use 5, 22 "
+            "or 39, or unwire context_latent to encode pixels." % n)
+    if steps > total:
+        raise ValueError(
+            "h3_motion_context: asked for %d latent steps, context_latent "
+            "has %d." % (steps, total))
+    start = total - steps
+    if start % 5 != 0:
+        raise RuntimeError(
+            "h3_motion_context: the %d step tail of a %d step latent starts "
+            "at cycle position %d, not 0, so its frame spans would not match "
+            "the positions written for them. Clip lengths are meant to make "
+            "this impossible; refusing rather than rendering a shifted join."
+            % (steps, total, start % 5))
+    covered = _pixel_frames(steps)
+    if covered != n:
+        raise RuntimeError(
+            "h3_motion_context: %d steps cover %d frames, expected %d."
+            % (steps, covered, n))
+    blocks = [video[:1, :, start + k:start + k + 1].clone()
+              for k in range(steps)]
+    return blocks, _step_offsets(steps), covered
+
+
 def _audio_tail_from_latent(latent, a_frames):
     """Slice the last `a_frames` worth of audio steps straight out of a
     generated H3 latent, skipping the decode -> re-encode round trip.
@@ -200,64 +336,50 @@ class MiniMaxH3MotionContext:
                 "conditioning": ("CONDITIONING",),
                 "vae": ("VAE",),
                 "latent": ("LATENT",),
-                "context_frames": ("IMAGE",),
-                "context_length": ("INT", {
-                    "default": 5, "min": 1, "max": 39,
-                    "tooltip": "Frames of the previous clip to carry over. In "
-                               "video mode only 1, 5, 22 and 39 are distinct; "
-                               "anything else is snapped DOWN to the nearest so "
-                               "the pinned run always ends at the clip's last "
-                               "frame."}),
-                "encode_mode": (["video", "frames"], {
-                    "default": "video",
-                    "tooltip": "video: one VAE call, motion lives inside the "
-                               "latent, fewer rows. frames: one call per frame, "
-                               "each pinned as a separate still."}),
-                "anchor_mode": (["head", "before"], {
-                    "default": "head",
-                    "tooltip": "head: pinned frames occupy the first indices and "
-                               "come back in the output, so trim them. before: "
-                               "negative indices, nothing wasted, but the "
-                               "coordinates overlap the text rows."}),
-                "crop": (["disabled", "center"], {"default": "disabled"}),
+                "context_length": (["22", "5", "39", "56"], {
+                    "default": "22",
+                    "tooltip": "Frames of the previous clip's picture to "
+                               "carry over. Only these lengths are whole "
+                               "numbers of latent steps, so only these are "
+                               "offered. 5 is just barely fluid, 22 is "
+                               "nearly seamless. Longer windows pin more "
+                               "motion but come off the front of the "
+                               "delivered clip, so 56 spends 2.3 seconds of "
+                               "the render on frames you throw away."}),
                 "audio_context_length": ("INT", {
                     "default": 22, "min": 0, "max": 240,
-                    "tooltip": "Frames of tail audio to pin, independent of the "
-                               "video window. 0 follows context_length. In "
-                               "timeline mode the window is END-aligned with "
-                               "the pinned video, so 22 with a 22-frame video "
-                               "window overlays it exactly; longer windows "
-                               "extend backwards into vacated coordinate "
-                               "space (untested)."}),
-                "audio_mode": (["timeline", "ref"], {
-                    "default": "timeline",
-                    "tooltip": "timeline: pinned audio gets coordinates on "
-                               "this clip's own timeline, end-aligned with "
-                               "the pinned video, so the model reads it as "
-                               "this clip's sound so far and continues it. "
-                               "ref: stock placement in a span before the "
-                               "clip, which the model imitates (similar "
-                               "music, not phase-locked) rather than "
-                               "continues."}),
+                    "tooltip": "Frames of tail audio to pin, independent of "
+                               "the picture window. 0 follows it. The window "
+                               "is END-aligned with the pinned video, so 22 "
+                               "against a 22-frame picture window overlays "
+                               "it exactly; longer windows reach further "
+                               "back into vacated coordinate space "
+                               "(untested)."}),
             },
             "optional": {
+                "context_frames": ("IMAGE", {
+                    "tooltip": "Decoded frames of the previous clip. Used "
+                               "when no context_latent is wired. When one "
+                               "is, the picture comes from it instead and "
+                               "this is ignored."}),
                 "context_latent": ("LATENT", {
-                    "tooltip": "Previous clip's SAMPLER OUTPUT latent (the same "
-                               "one you wire into the decode nodes). When "
-                               "supplied, the pinned audio is sliced straight "
-                               "from it, skipping the decode/re-encode round "
-                               "trip that dulls sound a little more at every "
-                               "link of a chain. Takes priority over "
-                               "context_audio; audio_vae is not needed on "
-                               "this path."}),
+                    "tooltip": "Previous clip's SAMPLER OUTPUT latent (the "
+                               "same one you wire into the decode nodes). "
+                               "Supplies both picture and sound, sliced "
+                               "straight out, skipping the decode and "
+                               "re-encode that cost a little quality at "
+                               "every link of a chain. Must be the same "
+                               "resolution as the clip being generated."}),
                 "audio_vae": ("VAE", {
-                    "tooltip": "H3 audio VAE. Supply with context_audio to carry "
-                               "the previous clip's tail sound across the join. "
-                               "Not needed when context_latent is wired."}),
+                    "tooltip": "H3 audio VAE. Supply with context_audio to "
+                               "carry the previous clip's tail sound across "
+                               "the join. Not needed when context_latent is "
+                               "wired."}),
                 "context_audio": ("AUDIO", {
-                    "tooltip": "Audio of the previous clip. The tail matching the "
-                               "pinned frames is encoded and pinned alongside "
-                               "them. Ignored when context_latent is wired."}),
+                    "tooltip": "Audio of the previous clip. The tail "
+                               "matching the pinned frames is encoded and "
+                               "pinned alongside them. Ignored when "
+                               "context_latent is wired."}),
             },
         }
 
@@ -267,17 +389,18 @@ class MiniMaxH3MotionContext:
     CATEGORY = "conditioning/minimax"
     DESCRIPTION = ("Pin a run of consecutive frames from a previous clip as "
                    "never-denoised conditioning rows, so the model reads real "
-                   "motion instead of guessing it from a single still.")
+                   "motion instead of guessing it from a single still. With "
+                   "context_latent wired, both picture and sound are sliced "
+                   "from the previous clip's latent, skipping the decode and "
+                   "re-encode that cost a little quality at every link.")
 
-    def apply(self, conditioning, vae, latent, context_frames, context_length,
-              encode_mode, anchor_mode, crop, audio_context_length=22,
-              audio_mode="timeline", context_latent=None, audio_vae=None,
-              context_audio=None):
-        if not is_applied():
-            raise RuntimeError(
-                "h3_motion_context: the layout patch is not active, so interior "
-                "anchors would be rejected by ComfyUI. Check the startup log for "
-                "the self-test failure reason.")
+    def apply(self, conditioning, vae, latent, context_length,
+              audio_context_length=22, context_frames=None,
+              context_latent=None, audio_vae=None, context_audio=None):
+        encode_mode, anchor_mode = ENCODE_MODE, ANCHOR_MODE
+        audio_mode, crop = AUDIO_MODE, CROP
+        context_length = int(context_length)
+        _ensure_layout_patch()
 
         video = _video_from_latent(latent)
         latent_t = int(video.shape[2])
@@ -285,12 +408,51 @@ class MiniMaxH3MotionContext:
         height = int(video.shape[3]) * 16
         frame_count = _pixel_frames(latent_t)
 
-        available = int(context_frames.shape[0])
+        # Decide where the pinned VIDEO comes from before anything else,
+        # because it decides how many frames are even available. Slicing it
+        # out of the previous clip's latent removes an h264 decode and a
+        # VAE encode from the path, and the blocks come out bit-identical
+        # to what the model produced rather than a reconstruction of it.
+        # A wired latent supplies the picture as well as the sound: the
+        # pinned blocks are then exactly the steps the model produced,
+        # with no h264 decode, no resize and no VAE round trip to shift
+        # colour or contrast. Frames are the path when no latent is wired.
+        if context_latent is not None:
+            src_video = _video_from_latent(context_latent)
+            src_w = int(src_video.shape[4]) * 16
+            src_h = int(src_video.shape[3]) * 16
+            if src_w != width or src_h != height:
+                # a latent cannot be resized. Falling back to frames here
+                # would quietly take the lossy path on a graph the user
+                # thinks is fine, and a resolution change mid-chain is
+                # nearly always a mistake, so say so instead.
+                raise ValueError(
+                    "h3_motion_context: context_latent is %dx%d but this "
+                    "clip is %dx%d. A latent cannot be resized, so the "
+                    "previous clip has to be regenerated at this "
+                    "resolution, or the chain restarted here."
+                    % (src_w, src_h, width, height))
+            if int(src_video.shape[1]) != int(video.shape[1]):
+                raise ValueError(
+                    "h3_motion_context: context_latent has %d channels, "
+                    "this clip has %d. That is not an H3 video latent from "
+                    "the same model."
+                    % (int(src_video.shape[1]), int(video.shape[1])))
+            available = _pixel_frames(int(src_video.shape[2]))
+            video_src = "latent"
+        else:
+            if context_frames is None:
+                raise ValueError(
+                    "h3_motion_context: nothing to pin. Wire context_latent "
+                    "(preferred) or context_frames.")
+            available = int(context_frames.shape[0])
+            video_src = "pixels"
+
         n = min(int(context_length), available)
         if n < 1:
-            raise ValueError("h3_motion_context: context_frames is empty")
+            raise ValueError("h3_motion_context: no frames available to pin")
         if n < context_length:
-            _LOG.warning("h3_motion_context: only %d frames supplied, pinning %d",
+            _LOG.warning("h3_motion_context: only %d frames available, pinning %d",
                          available, n)
 
         if encode_mode == "video":
@@ -312,10 +474,23 @@ class MiniMaxH3MotionContext:
                 "The pinned run must be a small fraction of the timeline."
                 % (n, frame_count))
 
-        # the LAST n frames of the incoming clip become the pinned run
-        tail = _resize(context_frames[available - n:], width, height, crop)
+        if video_src == "latent" and _steps_for_frames(n) is None:
+            # every window the node offers is a whole number of steps, so
+            # reaching this means the grid moved underneath us
+            raise RuntimeError(
+                "h3_motion_context: a %d frame window is not a whole number "
+                "of latent steps. VIDEO_RUN_GRID no longer matches the "
+                "VAE; refusing rather than rendering a shifted join." % n)
 
-        if encode_mode == "video":
+        if video_src == "latent":
+            blocks, offsets, covered = _video_tail_from_latent(
+                context_latent, n)
+            span = covered
+        else:
+            # the LAST n frames of the incoming clip become the pinned run
+            tail = _resize(context_frames[available - n:], width, height, crop)
+
+        if video_src == "pixels" and encode_mode == "video":
             # one call; the VAE reads the batch axis as time and compresses
             enc = vae.encode(tail)
             if getattr(enc, "ndim", 0) != 5:
@@ -338,7 +513,7 @@ class MiniMaxH3MotionContext:
                     % (n, steps, covered))
             blocks = [enc[:, :, k:k + 1] for k in range(steps)]
             span = covered
-        else:
+        elif video_src == "pixels":
             blocks, offsets = [], []
             for i in range(n):
                 blocks.append(vae.encode(tail[i:i + 1]))
@@ -366,14 +541,11 @@ class MiniMaxH3MotionContext:
         }
 
         ref_audio_t = 0
+        audio_ref = None
         a_frames = 0
         audio_src = "off"
         if context_latent is not None or context_audio is not None:
-            if not payload_patch_applied():
-                raise RuntimeError(
-                    "h3_motion_context: the payload patch is not active. Without it "
-                    "the audio ref would overwrite the pinned video latents and the "
-                    "motion context would be lost. Check the startup log.")
+            _ensure_payload_patch()
             # the audio window is independent of the video one: audio cond
             # rows cost rows but never cost delivered frames
             a_frames = int(audio_context_length) or span
@@ -411,15 +583,39 @@ class MiniMaxH3MotionContext:
                 # layout patch takes a fractional frame index.
                 end_frame = float(span if anchor_mode == "head" else 0)
                 end_frame += overhang / FRAME_RESCALE
+                # then snap the window onto the target's own audio grid.
+                # The end coordinate is FRAME_RESCALE * end_frame, and
+                # FRAME_RESCALE is 5/3, so unless that product happens to
+                # be a whole number the pinned rows land between the
+                # integer coordinates the target's audio rows occupy. A
+                # third of a step is 8.3 ms, which is the size of the
+                # constant late offset measured on chained clips. Whether
+                # it lands on or off the grid depends on the window
+                # length, the path, and the clip's own grid overhang, so
+                # it cycles rather than staying put. Rounding the end
+                # coordinate to the nearest integer costs at most a third
+                # of a step of placement and puts the pinned content on
+                # the same grid as the sound being generated from it.
+                end_coord = round(FRAME_RESCALE * end_frame)
+                end_frame = end_coord / FRAME_RESCALE
                 ref[MC_AUDIO_KEY] = end_frame
-            values["minimax_refs"] = [ref]
+            # APPEND rather than assign. Ref2VA conditioning already
+            # carries the graph's own image, video and audio reference
+            # blocks, and putting minimax_refs in `values` would replace
+            # the lot. Applied as a second call so the keyframe values
+            # land first and this one only touches the reference list.
+            audio_ref = ref
 
         out = node_helpers.conditioning_set_values(conditioning, values)
+        if audio_ref is not None:
+            out = node_helpers.conditioning_set_values(
+                out, {"minimax_refs": [audio_ref]}, append=True)
 
         trim = span if anchor_mode == "head" else 0
-        _LOG.info("h3_motion_context: %s/%s, %d frames -> %d cond blocks at "
-                  "indices %d..%d, %d frame clip at %dx%d, trim %d, audio %s",
-                  encode_mode, anchor_mode, n, len(blocks),
+        _LOG.info("h3_motion_context: video from %s, %s/%s, %d frames -> %d "
+                  "cond blocks at indices %d..%d, %d frame clip at %dx%d, "
+                  "trim %d, audio %s",
+                  video_src, encode_mode, anchor_mode, n, len(blocks),
                   indices[0], indices[-1], frame_count, width, height, trim,
                   ("%d frames -> %d latent steps (%.3fs) from %s, %s"
                    % (a_frames, ref_audio_t, ref_audio_t / AUDIO_HZ, audio_src,

@@ -89,9 +89,24 @@ def main():
     captured = {}
     nh = types.ModuleType("node_helpers")
 
-    def conditioning_set_values(cond, values):
-        captured.update(values)
-        return cond
+    def conditioning_set_values(cond, values, append=False):
+        # faithful to ComfyUI's node_helpers: copy each entry's dict, and
+        # when appending, concatenate onto whatever is already under the
+        # key instead of replacing it. The append path is what lets a
+        # Ref2VA graph keep its own reference blocks.
+        out = []
+        for t in cond:
+            n = [t[0], t[1].copy()]
+            for k, v in values.items():
+                if append:
+                    old = n[1].get(k, None)
+                    if old is not None:
+                        v = old + v
+                n[1][k] = v
+            out.append(n)
+        captured.clear()
+        captured.update(out[0][1])
+        return out
     nh.conditioning_set_values = conditioning_set_values
     sys.modules["node_helpers"] = nh
 
@@ -135,9 +150,16 @@ def main():
         submodule_search_locations=[_PKG_DIR])
     pkg = importlib.util.module_from_spec(spec)
     sys.modules["h3mc_pkg"] = pkg
-    spec.loader.exec_module(pkg)  # applies patches, registers nodes
+    spec.loader.exec_module(pkg)  # registers nodes; patches apply on first run
     nodes = sys.modules["h3mc_pkg.nodes"]
     assert pkg.NODE_CLASS_MAPPINGS
+    # importing the pack must not have touched ComfyUI yet
+    assert not nodes._layout_patch_applied(), \
+        "the layout patch was applied at import time"
+    assert not nodes._payload_patch_applied(), \
+        "the payload patch was applied at import time"
+    assert mm.PackedLayout.__init__.__name__ != "_patched_init", \
+        "the constructor was wrapped at import time"
 
     # a 124-frame clip: latent_t 37 (7 full 17-frame groups + 1 + 4),
     # audio grid ceil(124 * 5/3) = 207 steps, overhang exactly 1/3
@@ -150,7 +172,8 @@ def main():
     ])}
     # previous clip's sampler latent (same dims in this setup)
     prev = {"samples": Nested([
-        T(np.zeros((1, 16, latent_t, h, w), dtype=np.float32)),
+        T(np.arange(1 * 16 * latent_t * h * w, dtype=np.float32
+                    ).reshape(1, 16, latent_t, h, w)),
         T(np.arange(1 * 32 * 2 * audio_t, dtype=np.float32
                     ).reshape(1, 32, 2, audio_t)),
     ])}
@@ -165,9 +188,12 @@ def main():
     node = nodes.MiniMaxH3MotionContext()
     out, trim = node.apply(
         conditioning=[["c", {}]], vae=VAE(), latent=target,
-        context_frames=context, context_length=22, encode_mode="video",
-        anchor_mode="head", crop="disabled", audio_context_length=22,
-        audio_mode="timeline", context_latent=prev)
+        context_frames=context, context_length="22",
+        audio_context_length=22, context_latent=prev)
+
+    # ... and running one must have installed both
+    assert nodes._layout_patch_applied() and nodes._payload_patch_applied()
+    assert mm.PackedLayout.__init__.__name__ == "_patched_init"
 
     kfs = captured["minimax_keyframes"]
     assert len(kfs) == 7, len(kfs)
@@ -184,14 +210,100 @@ def main():
     # tail must be the LAST 37 steps of the source
     assert float(tail.a[0, 0, 0, -1]) == float(prev["samples"].parts[1]
                                                .a[0, 0, 0, -1])
-    overhang = audio_t - nodes.FRAME_RESCALE * frames  # 207 - 206.667
-    want_end = 22 + overhang / nodes.FRAME_RESCALE
+    # the window must land on the target's own integer audio grid: the
+    # end coordinate is FRAME_RESCALE * end_frame and the target's audio
+    # rows sit on integers, so a fractional end coordinate would place
+    # the pinned content between them (a third of a step is 8.3 ms)
     got_end = ref[nodes.MC_AUDIO_KEY]
-    assert abs(got_end - want_end) < 1e-9, (got_end, want_end)
+    end_coord = nodes.FRAME_RESCALE * got_end
+    assert abs(end_coord - round(end_coord)) < 1e-9, end_coord
+    assert abs(end_coord - 37.0) < 1e-9, end_coord
     assert abs(got_end - 22.2) < 1e-6, got_end
-    print("latent path: 7 cond blocks at %s, audio 37 steps sliced from "
-          "latent tail, end_frame %.4f (overhang-compensated)" %
-          (idx, got_end))
+    # the pinned VIDEO must have come out of the latent too, not the VAE.
+    # The fake VAE returns zeros, so any nonzero block proves the source,
+    # and each block must equal the matching step of the source latent.
+    kf_blocks = [kf["latent"] for kf in kfs]
+    src = prev["samples"].parts[0].a
+    start = latent_t - len(kf_blocks)          # 37 - 7 = 30, cycle pos 0
+    assert start % 5 == 0, start
+    for k, blk in enumerate(kf_blocks):
+        assert tuple(blk.shape) == (1, 16, 1, h, w), blk.shape
+        assert np.array_equal(blk.a[0, :, 0], src[0, :, start + k]), k
+    assert nodes._steps_for_frames(22) == 7
+    assert nodes._steps_for_frames(5) == 2
+    assert nodes._steps_for_frames(39) == 12
+    assert nodes._steps_for_frames(1) == 1
+    assert nodes._steps_for_frames(3) is None    # not a whole step boundary
+    print("latent path: 7 cond blocks at %s sliced from the latent tail "
+          "(bit-identical to the source steps), audio 37 steps, end_frame "
+          "%.4f (overhang-compensated)" % (idx, got_end))
+
+    # no latent wired: the pixel path, same offsets, and the fake VAE
+    # returns zeros so the blocks must now be zero rather than sliced
+    captured.clear()
+    node.apply(
+        conditioning=[["c", {}]], vae=VAE(), latent=target,
+        context_frames=context, context_length="22",
+        audio_context_length=22)
+    px = captured["minimax_keyframes"]
+    assert [kf[nodes.MC_KEY] for kf in px] == idx, "offsets differ by source"
+    assert float(px[0]["latent"].a.max()) == 0.0, "did not use the VAE"
+    print("pixels path: same %d blocks at the same offsets, encoded rather "
+          "than sliced" % len(px))
+
+    # a resolution change cannot slice a latent and must refuse, not
+    # quietly take the lossy path
+    small = {"samples": Nested([
+        T(np.zeros((1, 16, latent_t, h // 2, w // 2), dtype=np.float32)),
+        T(np.zeros((1, 32, 2, audio_t), dtype=np.float32)),
+    ])}
+    try:
+        node.apply(
+            conditioning=[["c", {}]], vae=VAE(), latent=target,
+            context_frames=context, context_length="22",
+            audio_context_length=22, context_latent=small)
+    except ValueError as e:
+        assert "cannot be resized" in str(e), str(e)
+        print("resolution change: refused, with the reason and the two "
+              "resolutions named")
+    else:
+        raise AssertionError("mismatched latent did not refuse")
+
+    # nothing wired at all
+    try:
+        node.apply(
+            conditioning=[["c", {}]], vae=VAE(), latent=target,
+            context_length="22", audio_context_length=22)
+    except ValueError as e:
+        assert "nothing to pin" in str(e), str(e)
+        print("nothing wired: refused with a plain reason")
+    else:
+        raise AssertionError("no context at all did not refuse")
+
+    # the constants that replaced the widgets must be on the good values
+    assert nodes.ENCODE_MODE == "video"
+    assert nodes.ANCHOR_MODE == "head"
+    assert nodes.AUDIO_MODE == "timeline"
+    assert nodes.CROP == "disabled"
+
+    # the cycle-position property the whole latent video path rests on,
+    # checked across every clip length and window rather than argued for
+    for g in range(1, 40):
+        steps_total = 5 * g + 2
+        frames_total = nodes._pixel_frames(steps_total)
+        assert (frames_total - 5) % 17 == 0, (g, frames_total)
+        for wnd in (5, 22, 39, 56):
+            st = nodes._steps_for_frames(wnd)
+            if st is None or st > steps_total:
+                continue
+            begin = steps_total - st
+            assert begin % 5 == 0, (frames_total, wnd, begin % 5)
+            assert nodes._pixel_frames(st) == wnd
+            # offsets computed for a fresh run must match the sliced run
+            assert (nodes._step_offsets(st)
+                    == [nodes._pixel_frames(k) for k in range(st)])
+    print("cycle check: every clip length 22..%d x windows 5/22/39/56 "
+          "slices from cycle position 0" % nodes._pixel_frames(5 * 39 + 2))
 
     # decoded-audio path must still work and carry integer end_frame
     captured.clear()
@@ -207,12 +319,61 @@ def main():
              "sample_rate": 32000}
     node.apply(
         conditioning=[["c", {}]], vae=VAE(), latent=target,
-        context_frames=context, context_length=22, encode_mode="video",
-        anchor_mode="head", crop="disabled", audio_context_length=22,
-        audio_mode="timeline", audio_vae=AudioVAE(), context_audio=audio)
+        context_frames=context, context_length="22",
+        audio_context_length=22, audio_vae=AudioVAE(), context_audio=audio)
     ref2 = captured["minimax_refs"][0]
-    assert abs(ref2[nodes.MC_AUDIO_KEY] - 22.0) < 1e-9
-    print("vae path: unchanged, end_frame %.1f" % ref2[nodes.MC_AUDIO_KEY])
+    # no overhang to compensate on this path, but the same grid rule
+    # applies: 22 frames is 36.667 steps, which must snap to 37
+    end2 = nodes.FRAME_RESCALE * ref2[nodes.MC_AUDIO_KEY]
+    assert abs(end2 - 37.0) < 1e-9, end2
+    print("vae path: window snapped to the audio grid, end coord %.1f" % end2)
+
+    # every clip length on the ladder, every window, both paths: the
+    # pinned window must always end on an integer audio coordinate
+    import math as _math
+    for g in range(2, 13):
+        f = 17 * g + 5
+        at = _math.ceil(nodes.FRAME_RESCALE * f)
+        oh = at - nodes.FRAME_RESCALE * f
+        for span in (5, 22, 39, 56):
+            for ohv in (0.0, oh):
+                ef = span + ohv / nodes.FRAME_RESCALE
+                ec = round(nodes.FRAME_RESCALE * ef)
+                ef = ec / nodes.FRAME_RESCALE
+                c = nodes.FRAME_RESCALE * ef
+                assert abs(c - round(c)) < 1e-9, (f, span, ohv, c)
+    print("grid check: every ladder length x window 5/22/39/56 x both "
+          "audio paths ends on an integer audio coordinate")
+
+    # Ref2VA: a graph whose conditioning already carries reference blocks
+    # must keep every one of them, with the motion context audio block
+    # appended rather than replacing the lot. Before this, the node
+    # assigned minimax_refs outright and an R2V graph silently lost its
+    # references at the moment chaining was switched on.
+    captured.clear()
+    existing = [
+        {"kind": "image", "latent_h": 8, "latent_w": 12},
+        {"kind": "video_audio", "latent_h": 8, "latent_w": 12,
+         "latent_t": 3, "ref_audio_t": 5},
+        {"kind": "audio", "ref_audio_t": 9},
+    ]
+    r2v_cond = [["c", {"minimax_refs": [dict(r) for r in existing]}]]
+    out_cond, _ = node.apply(
+        conditioning=r2v_cond, vae=VAE(), latent=target,
+        context_frames=context, context_length="22",
+        audio_context_length=22, context_latent=prev)
+    refs_out = captured["minimax_refs"]
+    assert len(refs_out) == 4, len(refs_out)
+    for got, want in zip(refs_out, existing):
+        assert got["kind"] == want["kind"], (got, want)
+        assert got.get(nodes.MC_AUDIO_KEY) is None, got
+    assert refs_out[-1][nodes.MC_AUDIO_KEY] is not None
+    assert refs_out[-1]["ref_audio_t"] == 37
+    # the caller's own list must not have been mutated in place
+    assert len(r2v_cond[0][1]["minimax_refs"]) == 3
+    assert captured["minimax_keyframes"], "keyframes lost on the R2V path"
+    print("R2V path: 3 incoming references preserved, motion context audio "
+          "appended as the 4th, keyframes intact")
 
     # save -> load -> context_latent roundtrip across "runs"
     import time
@@ -232,9 +393,8 @@ def main():
     captured.clear()
     node.apply(
         conditioning=[["c", {}]], vae=VAE(), latent=target,
-        context_frames=context, context_length=22, encode_mode="video",
-        anchor_mode="head", crop="disabled", audio_context_length=22,
-        audio_mode="timeline", context_latent=loaded)
+        context_frames=context, context_length="22",
+        audio_context_length=22, context_latent=loaded)
     ref3 = captured["minimax_refs"][0]
     want = float(prev2["samples"].parts[1].a[0, 0, 0, -1])
     got = float(ref3["audio_latent"].a[0, 0, 0, -1])
