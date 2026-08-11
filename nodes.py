@@ -35,6 +35,7 @@ import os
 import comfy.utils
 import folder_paths
 import node_helpers
+import torch
 
 try:
     from safetensors.torch import load_file as _st_load, save_file as _st_save
@@ -288,11 +289,13 @@ def _audio_tail_from_latent(latent, a_frames):
     generated H3 latent, skipping the decode -> re-encode round trip.
 
     Returns (tail latent [1, C, 2, rt], rt, overhang) where rt counts
-    40 Hz latent steps and overhang is the fraction of a step by which the
-    clip's audio grid extends past its last pixel frame. H3 rounds the
-    audio grid UP (124 frames want 206.67 steps, the layout allocates
-    207), so the latent's final step reaches ~overhang/40 s beyond the
-    last frame. The decoded-audio path never sees this because match_tail
+    40 Hz latent steps and overhang is the SIGNED fraction of a step
+    between the clip's audio grid and its last pixel frame. H3 rounds the
+    audio grid to the NEAREST step, not up: 124 frames want 206.67 and
+    become 207 (overhang +0.33), while 260 frames want 433.33 and become
+    433 (overhang -0.33). Any raw length with frames % 3 == 2 lands on the
+    negative side, so an unsigned band would fail open on half the legal
+    clip lengths. The decoded-audio path never sees this because match_tail
     cuts it; on this path the caller compensates the placement with it,
     so the pinned content lands exactly where its samples actually sit.
     """
@@ -312,7 +315,7 @@ def _audio_tail_from_latent(latent, a_frames):
     total_t = int(audio.shape[-1])
     frames = _pixel_frames(int(video.shape[2]))
     overhang = total_t - FRAME_RESCALE * frames
-    if not (0.0 <= overhang < 1.0):
+    if not (-0.5 < overhang < 0.5):
         _LOG.warning(
             "h3_motion_context: context_latent audio grid is unexpected "
             "(%d steps for %d frames); assuming no overhang.", total_t, frames)
@@ -577,9 +580,11 @@ class MiniMaxH3MotionContext:
                 # the tail of clip A, so both must end at the same instant
                 # of the new timeline -- frame `span` in head mode (where
                 # A's last frame sits), frame 0 in before mode. On the
-                # latent path the sliced content reaches `overhang` of a
-                # step past A's last frame (H3 rounds its audio grid up),
-                # so the end coordinate moves by exactly that much; the
+                # latent path the sliced content ends `overhang` of a step
+                # from A's last frame -- signed, because H3 rounds its audio
+                # grid to the nearest step, so the grid can end just short of
+                # the last frame as easily as past it. The end coordinate
+                # moves by exactly that much, in either direction; the
                 # layout patch takes a fractional frame index.
                 end_frame = float(span if anchor_mode == "head" else 0)
                 end_frame += overhang / FRAME_RESCALE
@@ -719,9 +724,14 @@ class MiniMaxH3MotionContextTrim:
                               "(%.2fms) so audio matches %d frames exactly",
                               over, over / sr * 1000.0, frames_left)
                 elif have < want:
-                    _LOG.warning("h3_motion_context: audio is %.2fms shorter than "
-                                 "%d frames; leaving the tail alone",
-                                 (want - have) / sr * 1000.0, frames_left)
+                    # A fractional-step shortage left alone compounds down a
+                    # chain: every clip's picture would run further ahead of
+                    # its sound than the last. Pad to the exact sample count.
+                    missing = want - have
+                    waveform = torch.nn.functional.pad(waveform, (0, missing))
+                    _LOG.info("h3_motion_context: tail padded %d zero samples "
+                              "(%.2fms) so audio matches %d frames exactly",
+                              missing, missing / sr * 1000.0, frames_left)
 
             out_audio = {"waveform": waveform, "sample_rate": sr}
             _LOG.info("h3_motion_context: %d frames / %.4fs picture, %.4fs sound, "
