@@ -239,13 +239,14 @@ def main():
           "%.4f (overhang-compensated)" % (idx, got_end))
 
     # no latent wired: the pixel path, same offsets, and the fake VAE
-    # returns zeros so the blocks must now be zero rather than sliced
-    captured.clear()
-    node.apply(
+    # returns zeros so the blocks must now be zero rather than sliced.
+    # No audio either, so node_helpers is never called: read the
+    # conditioning the node returns rather than the capture hook
+    res, _ = node.apply(
         conditioning=[["c", {}]], vae=VAE(), latent=target,
         context_frames=context, context_length="22",
         audio_context_length=22)
-    px = captured["minimax_keyframes"]
+    px = res[0][1]["minimax_keyframes"]
     assert [kf[nodes.MC_KEY] for kf in px] == idx, "offsets differ by source"
     assert float(px[0]["latent"].a.max()) == 0.0, "did not use the VAE"
     print("pixels path: same %d blocks at the same offsets, encoded rather "
@@ -330,10 +331,12 @@ def main():
 
     # every clip length on the ladder, every window, both paths: the
     # pinned window must always end on an integer audio coordinate
-    import math as _math
     for g in range(2, 13):
         f = 17 * g + 5
-        at = _math.ceil(nodes.FRAME_RESCALE * f)
+        # nearest, not ceil: ceil would simulate +2/3 on the lengths that
+        # actually run -1/3, so this loop used to exercise a value the
+        # model never produces
+        at = round(nodes.FRAME_RESCALE * f)
         oh = at - nodes.FRAME_RESCALE * f
         for span in (5, 22, 39, 56):
             for ohv in (0.0, oh):
@@ -344,6 +347,88 @@ def main():
                 assert abs(c - round(c)) < 1e-9, (f, span, ohv, c)
     print("grid check: every ladder length x window 5/22/39/56 x both "
           "audio paths ends on an integer audio coordinate")
+
+    # All three frame-count residues, latent path, 22-frame window. The
+    # 124-frame case above is frames % 3 == 1, the one residue where
+    # rounding up and rounding to nearest agree, so on its own it cannot
+    # tell the two rules apart. 260 frames is the negative-overhang case:
+    # compensation moves the end coordinate to 36.33, which rounds to 36,
+    # where failing open would leave it at 36.67 and round to 37, a whole
+    # audio step (25 ms) late.
+    import logging as _logging
+
+    class _Catcher(_logging.Handler):
+        def __init__(self):
+            _logging.Handler.__init__(self)
+            self.msgs = []
+
+        def emit(self, record):
+            self.msgs.append(record.getMessage())
+
+    catcher = _Catcher()
+    catcher.setLevel(_logging.WARNING)
+    nodes._LOG.addHandler(catcher)
+    try:
+        for lt, f, at, want_coord, want_end in (
+                (37, 124, 207, 37, 22.2),   # +1/3, reaches past
+                (72, 243, 405, 37, 22.2),   #    0, exact
+                (77, 260, 433, 36, 21.6)):  # -1/3, falls short
+            assert nodes._pixel_frames(lt) == f, (lt, f)
+            assert at == round(nodes.FRAME_RESCALE * f), (f, at)
+            captured.clear()
+            del catcher.msgs[:]
+            tgt = {"samples": Nested([
+                T(np.zeros((1, 16, lt, h, w), dtype=np.float32)),
+                T(np.zeros((1, 32, 2, at), dtype=np.float32)),
+            ])}
+            src = {"samples": Nested([
+                T(np.arange(1 * 16 * lt * h * w, dtype=np.float32
+                            ).reshape(1, 16, lt, h, w)),
+                T(np.arange(1 * 32 * 2 * at, dtype=np.float32
+                            ).reshape(1, 32, 2, at)),
+            ])}
+            node.apply(
+                conditioning=[["c", {}]], vae=VAE(), latent=tgt,
+                context_frames=T(np.zeros((f, 480, 864, 3),
+                                          dtype=np.float32)),
+                context_length="22", audio_context_length=22,
+                context_latent=src)
+            got = captured["minimax_refs"][0][nodes.MC_AUDIO_KEY]
+            coord = nodes.FRAME_RESCALE * got
+            assert abs(coord - round(coord)) < 1e-9, (f, coord)
+            assert abs(coord - want_coord) < 1e-9, (f, coord, want_coord)
+            assert abs(got - want_end) < 1e-6, (f, got, want_end)
+            # the grid is legal on all three, so nothing may warn about it
+            assert not [m for m in catcher.msgs if "audio grid" in m], \
+                (f, catcher.msgs)
+    finally:
+        nodes._LOG.removeHandler(catcher)
+    print("residue check: frames % 3 in 0/1/2 all accepted, end coords "
+          "37/37/36 (the -1/3 case would be 37 if it failed open)")
+
+    # The trim node's match_tail: a long tail is truncated, a short one is
+    # padded, both to exactly frames/fps. The short case only occurs on
+    # frames % 3 == 2 clips, which is why it went unexercised.
+    trimmer = nodes.MiniMaxH3MotionContextTrim()
+    for f, direction in ((124, "long"), (243, "exact"), (260, "short")):
+        sr = 32000
+        # what H3 actually ships: the audio grid at nearest rounding,
+        # decoded back to samples
+        steps = round(nodes.FRAME_RESCALE * f)
+        have = int(round(steps / nodes.AUDIO_HZ * sr))
+        want = int(round((f - 22) / 24.0 * sr))
+        imgs = T(np.zeros((f, 8, 8, 3), dtype=np.float32))
+        wav = T(np.zeros((1, 2, have), dtype=np.float32))
+        _, out = trimmer.trim(
+            images=imgs, trim_frames=22,
+            audio={"waveform": wav, "sample_rate": sr}, fps=24.0,
+            match_tail=True)
+        got = int(out["waveform"].shape[-1])
+        assert got == want, (f, direction, got, want)
+        # and the drift the node reports must be under half a sample
+        assert abs(got / sr - (f - 22) / 24.0) * 1000.0 < 0.02, (f, got)
+    print("match_tail check: long tail trimmed, short tail padded, all "
+          "three residues land on the exact sample count")
 
     # Ref2VA: a graph whose conditioning already carries reference blocks
     # must keep every one of them, with the motion context audio block
@@ -374,6 +459,51 @@ def main():
     assert captured["minimax_keyframes"], "keyframes lost on the R2V path"
     print("R2V path: 3 incoming references preserved, motion context audio "
           "appended as the 4th, keyframes intact")
+
+    # last_frame passthrough: an fl2va graph's own anchors used to be
+    # replaced outright. The last-frame anchor must survive, tagged with
+    # MC_KEY so the layout patch compensates it alongside ours; the
+    # first-frame anchor sits inside the pinned head, which the pinned
+    # run already decides, so it is dropped with a warning.
+    captured.clear()
+    up_kf = [{"resolved_frame_index": 0, "latent": "FF"},
+             {"resolved_frame_index": frames - 1, "latent": "LF"}]
+    fl_cond = [["c", {"minimax_keyframes": [dict(k) for k in up_kf],
+                      "minimax_frame_count": frames}]]
+    catcher2 = _Catcher()
+    nodes._LOG.addHandler(catcher2)
+    try:
+        node.apply(
+            conditioning=fl_cond, vae=VAE(), latent=target,
+            context_frames=context, context_length="22",
+            audio_context_length=22, context_latent=prev)
+    finally:
+        nodes._LOG.removeHandler(catcher2)
+    merged = captured["minimax_keyframes"]
+    assert len(merged) == 1 + 7, len(merged)
+    assert merged[0]["latent"] == "LF"
+    assert merged[0][nodes.MC_KEY] == frames - 1
+    assert merged[0]["resolved_frame_index"] == frames - 1
+    assert [kf[nodes.MC_KEY] for kf in merged[1:]] == idx
+    assert any("dropped 1 keyframe anchor" in m for m in catcher2.msgs), \
+        catcher2.msgs
+    # the caller's dicts must not have been tagged in place
+    assert nodes.MC_KEY not in fl_cond[0][1]["minimax_keyframes"][1]
+    # keyframes resolved against a different clip length are a wiring
+    # error: the anchor would land at the wrong frame, so refuse
+    bad_cond = [["c", {"minimax_keyframes": [dict(up_kf[1])],
+                       "minimax_frame_count": frames + 17}]]
+    try:
+        node.apply(conditioning=bad_cond, vae=VAE(), latent=target,
+                   context_frames=context, context_length="22",
+                   audio_context_length=22, context_latent=prev)
+    except ValueError as e:
+        assert "resolved for a" in str(e), str(e)
+    else:
+        raise AssertionError("frame-count mismatch did not refuse")
+    print("last_frame path: upstream last-frame anchor kept and tagged, "
+          "first-frame anchor dropped from the pinned head, frame-count "
+          "mismatch refused")
 
     # save -> load -> context_latent roundtrip across "runs"
     import time

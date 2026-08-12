@@ -33,6 +33,21 @@ Reading the result:
                                                   all; windowing will never
                                                   fix it (idea 4 territory)
 
+One limitation to know before trusting a lag. Cross-correlation cannot
+tell a true alignment from one a whole cycle away, so on strongly
+periodic content a lag larger than half a period reads as the nearest
+alias: 60 ms on material with an 18 ms period comes back as -12.7 ms, at
+high correlation. Beat-driven music is exactly this case. Tracking keeps
+a drift from cycle-hopping mid-span, and the first window takes the
+global peak so a uniform whole-step offset is visible at all, but a large
+uniform offset on periodic content is not something the method resolves.
+Read a small lag as reliable and a large one as "at least this much,
+possibly plus a whole number of cycles".
+
+The node does the same measurement without the file round trip, and
+without having to infer where the seam is: H3 Motion Context Seam Probe,
+wired between the audio VAE decode and the trim node.
+
 Dependencies: numpy, plus ONE of torchaudio / soundfile / stdlib wave
 (16/32-bit PCM wav). ComfyUI's embedded python has numpy and torchaudio.
 Run it with that interpreter if your system python lacks them, e.g.:
@@ -158,7 +173,7 @@ def main():
 
     lags, corrs = [], []
     t = 0
-    prev_lag = 0  # samples; tracking starts from perfect alignment
+    prev_lag = None  # samples; seeded from the first window's global peak
     # continue a little past the seam to see whether alignment against
     # A's (now nonexistent) continuation collapses, as it should
     while t + win <= span + int(0.2 * sr) and t + win <= len(b):
@@ -175,8 +190,19 @@ def main():
         # index in the ncc curve where lag == prev_lag; sign convention:
         # positive lag = B is LATE (its content matches an EARLIER part
         # of A than the nominal position), so match offset = centre - lag
-        expect_idx = (centre_in_a - prev_lag) - lo
-        pick, corr = tracked_peak(ncc, expect_idx)
+        if prev_lag is None:
+            # Nothing to track from yet, so take the global peak. Seeding
+            # at zero instead assumes the first window is already
+            # aligned, and when the whole join is offset by a step that
+            # assumption makes the tracker pick the nearest cycle alias:
+            # a uniform 25 ms lag on 55 Hz-fundamental content reads as
+            # 6.8 ms. That is the failure this probe exists to find, so
+            # it must not be the one case it cannot see.
+            pick = int(np.argmax(ncc))
+            corr = float(ncc[pick])
+        else:
+            expect_idx = (centre_in_a - prev_lag) - lo
+            pick, corr = tracked_peak(ncc, expect_idx)
         lag = centre_in_a - (lo + pick)
         in_span = t + win <= span
         tag = "reconstruction" if in_span else "past seam"

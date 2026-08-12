@@ -35,6 +35,7 @@ import os
 import comfy.utils
 import folder_paths
 import node_helpers
+import torch
 
 try:
     from safetensors.torch import load_file as _st_load, save_file as _st_save
@@ -226,9 +227,9 @@ def _steps_for_frames(n):
 
     Returns None when no whole number of steps covers n. The video VAE's
     steps alternate 1, 4, 4, 4, 4 pixel frames, so only certain totals are
-    reachable: 1, 5, 9, ... and of the windows this node offers, 5, 22 and
-    39 land on 2, 7 and 12 steps. The 1-frame window does not, because the
-    last step of a clip spans 4 frames, not 1.
+    reachable: 1, 5, 9, ... and of the windows this node offers, 5, 22, 39
+    and 56 land on 2, 7, 12 and 17 steps. The 1-frame window does not,
+    because the last step of a clip spans 4 frames, not 1.
     """
     k, covered = 0, 0
     while covered < n:
@@ -246,7 +247,7 @@ def _video_tail_from_latent(latent, n):
 
     This is only sound because the tail window always starts at cycle
     position 0. A clip is 17g+5 frames, which is 5g+2 latent steps; the
-    windows are 2, 7 and 12 steps; and 5g+2 minus any of those is a
+    windows are 2, 7, 12 and 17 steps; and 5g+2 minus any of those is a
     multiple of 5. So the sliced run has the same 1, 4, 4, 4, 4 phase as a
     freshly encoded one and _step_offsets applies unchanged. Asserted
     below rather than assumed, because if it ever stopped holding the
@@ -259,8 +260,8 @@ def _video_tail_from_latent(latent, n):
     if steps is None:
         raise ValueError(
             "h3_motion_context: a %d frame window is not a whole number of "
-            "latent steps, so it cannot be sliced from a latent. Use 5, 22 "
-            "or 39, or unwire context_latent to encode pixels." % n)
+            "latent steps, so it cannot be sliced from a latent. Use 5, 22, "
+            "39 or 56, or unwire context_latent to encode pixels." % n)
     if steps > total:
         raise ValueError(
             "h3_motion_context: asked for %d latent steps, context_latent "
@@ -288,13 +289,23 @@ def _audio_tail_from_latent(latent, a_frames):
     generated H3 latent, skipping the decode -> re-encode round trip.
 
     Returns (tail latent [1, C, 2, rt], rt, overhang) where rt counts
-    40 Hz latent steps and overhang is the fraction of a step by which the
-    clip's audio grid extends past its last pixel frame. H3 rounds the
-    audio grid UP (124 frames want 206.67 steps, the layout allocates
-    207), so the latent's final step reaches ~overhang/40 s beyond the
-    last frame. The decoded-audio path never sees this because match_tail
-    cuts it; on this path the caller compensates the placement with it,
-    so the pinned content lands exactly where its samples actually sit.
+    40 Hz latent steps and overhang is the signed fraction of a step by
+    which the clip's audio grid overshoots its last pixel frame.
+
+    H3 rounds the audio grid to the NEAREST step, not up, so overhang is
+    negative for a third of legal clip lengths. 5/3 of a frame count
+    lands on .0, .333 or .667 and never on .5, so there are exactly three
+    cases:
+
+        frames % 3 == 0   124 -> n/a          exact, overhang  0
+        frames % 3 == 1   124 wants 206.67, allocates 207, overhang +1/3
+        frames % 3 == 2   260 wants 433.33, allocates 433, overhang -1/3
+
+    A positive overhang means the latent's final step reaches past the
+    last frame, a negative one means it stops short. Either way the
+    caller compensates the placement with it, so the pinned content lands
+    where its samples actually sit. The decoded-audio path never sees
+    this because match_tail cuts at the frame.
     """
     parts = _streams_from_latent(latent)
     if len(parts) < 2:
@@ -312,7 +323,10 @@ def _audio_tail_from_latent(latent, a_frames):
     total_t = int(audio.shape[-1])
     frames = _pixel_frames(int(video.shape[2]))
     overhang = total_t - FRAME_RESCALE * frames
-    if not (0.0 <= overhang < 1.0):
+    # legal values are exactly 0, +1/3 and -1/3; the band is the widest
+    # one that admits all three and still rejects a grid that is out by a
+    # whole step or more
+    if not (-0.5 < overhang < 0.5):
         _LOG.warning(
             "h3_motion_context: context_latent audio grid is unexpected "
             "(%d steps for %d frames); assuming no overhang.", total_t, frames)
@@ -347,14 +361,16 @@ class MiniMaxH3MotionContext:
                                "delivered clip, so 56 spends 2.3 seconds of "
                                "the render on frames you throw away."}),
                 "audio_context_length": ("INT", {
-                    "default": 22, "min": 0, "max": 240,
+                    "default": 24, "min": 0, "max": 240,
                     "tooltip": "Frames of tail audio to pin, independent of "
                                "the picture window. 0 follows it. The window "
-                               "is END-aligned with the pinned video, so 22 "
-                               "against a 22-frame picture window overlays "
-                               "it exactly; longer windows reach further "
-                               "back into vacated coordinate space "
-                               "(untested)."}),
+                               "is END-aligned with the pinned video, so "
+                               "this only controls how far back the sound "
+                               "reaches. Multiples of 3 land exactly on the "
+                               "40 Hz audio grid and multiples of 24 are "
+                               "whole seconds: 24 pins the last second. "
+                               "Off-grid values are widened to the nearest "
+                               "whole step."}),
             },
             "optional": {
                 "context_frames": ("IMAGE", {
@@ -392,10 +408,12 @@ class MiniMaxH3MotionContext:
                    "motion instead of guessing it from a single still. With "
                    "context_latent wired, both picture and sound are sliced "
                    "from the previous clip's latent, skipping the decode and "
-                   "re-encode that cost a little quality at every link.")
+                   "re-encode that cost a little quality at every link. A "
+                   "last_frame anchor on the incoming conditioning is kept "
+                   "and pinned alongside the head.")
 
     def apply(self, conditioning, vae, latent, context_length,
-              audio_context_length=22, context_frames=None,
+              audio_context_length=24, context_frames=None,
               context_latent=None, audio_vae=None, context_audio=None):
         encode_mode, anchor_mode = ENCODE_MODE, ANCHOR_MODE
         audio_mode, crop = AUDIO_MODE, CROP
@@ -465,7 +483,7 @@ class MiniMaxH3MotionContext:
             if run != n:
                 _LOG.warning(
                     "h3_motion_context: %d frames is off the VAE grid; pinning "
-                    "the last %d instead (usable runs: 1, 5, 22, 39)", n, run)
+                    "the last %d instead (usable runs: 1, 5, 22, 39, 56)", n, run)
             n = run
 
         if n >= frame_count:
@@ -535,11 +553,6 @@ class MiniMaxH3MotionContext:
                 "latent": blk,
             })
 
-        values = {
-            "minimax_keyframes": keyframes,
-            "minimax_frame_count": frame_count,
-        }
-
         ref_audio_t = 0
         audio_ref = None
         a_frames = 0
@@ -577,10 +590,12 @@ class MiniMaxH3MotionContext:
                 # the tail of clip A, so both must end at the same instant
                 # of the new timeline -- frame `span` in head mode (where
                 # A's last frame sits), frame 0 in before mode. On the
-                # latent path the sliced content reaches `overhang` of a
-                # step past A's last frame (H3 rounds its audio grid up),
-                # so the end coordinate moves by exactly that much; the
-                # layout patch takes a fractional frame index.
+                # latent path the sliced content overshoots A's last
+                # frame by `overhang` of a step, signed, because H3
+                # rounds its audio grid to the nearest step and so falls
+                # short as often as it reaches past. The end coordinate
+                # moves by exactly that much; the layout patch takes a
+                # fractional frame index.
                 end_frame = float(span if anchor_mode == "head" else 0)
                 end_frame += overhang / FRAME_RESCALE
                 # then snap the window onto the target's own audio grid.
@@ -601,12 +616,56 @@ class MiniMaxH3MotionContext:
                 ref[MC_AUDIO_KEY] = end_frame
             # APPEND rather than assign. Ref2VA conditioning already
             # carries the graph's own image, video and audio reference
-            # blocks, and putting minimax_refs in `values` would replace
+            # blocks, and assigning minimax_refs outright would replace
             # the lot. Applied as a second call so the keyframe values
             # land first and this one only touches the reference list.
             audio_ref = ref
 
-        out = node_helpers.conditioning_set_values(conditioning, values)
+        # MERGE with any keyframes already on the conditioning instead of
+        # replacing them. A last_frame anchor from the upstream node is a
+        # legitimate companion to a chained head: the pinned run decides
+        # how the clip starts, the anchor decides where it ends. Each kept
+        # keyframe is tagged with its own position under MC_KEY so the
+        # layout patch gives it the same reference compensation as ours;
+        # untagged it would either trip the mixed-keyframe guard (with
+        # audio) or sit uncompensated next to compensated anchors (without).
+        # At p = frame_count-1 the patch reproduces stock's coordinate bit
+        # for bit, so tagging changes nothing when no reference is present.
+        # Anchors inside the pinned head are dropped: the pinned run
+        # already decides those frames, and a second cond block at the
+        # same coordinate would fight it.
+        head_end = span if anchor_mode == "head" else 0
+        out = []
+        dropped = []
+        for emb, extra in conditioning:
+            d = extra.copy()
+            prior = d.get("minimax_keyframes") or []
+            pfc = d.get("minimax_frame_count")
+            if prior and pfc is not None and int(pfc) != frame_count:
+                raise ValueError(
+                    "h3_motion_context: the conditioning carries keyframes "
+                    "resolved for a %d frame clip, but the latent is %d "
+                    "frames. Wire the conditioning and the latent from the "
+                    "same node." % (int(pfc), frame_count))
+            kept = []
+            for kf in prior:
+                p = int(kf.get(MC_KEY, kf.get("resolved_frame_index", 0)))
+                if p < head_end:
+                    dropped.append(p)
+                    continue
+                kf = dict(kf)
+                kf[MC_KEY] = p
+                kept.append(kf)
+            d["minimax_keyframes"] = kept + keyframes
+            d["minimax_frame_count"] = frame_count
+            out.append([emb, d])
+        if dropped:
+            _LOG.warning(
+                "h3_motion_context: dropped %d keyframe anchor(s) at "
+                "frame(s) %s: the pinned head already decides frames "
+                "0..%d. A last_frame anchor is kept.",
+                len(dropped), sorted(set(dropped)), head_end - 1)
+
         if audio_ref is not None:
             out = node_helpers.conditioning_set_values(
                 out, {"minimax_refs": [audio_ref]}, append=True)
@@ -643,13 +702,21 @@ class MiniMaxH3MotionContextTrim:
 
     The tail needs the same treatment for a different reason. H3's audio
     latent runs at 40 Hz against 24 fps picture, and FRAME_RESCALE is 5/3,
-    so a 124 frame clip wants 206.67 audio steps and the layout rounds up
-    to 207. Every clip therefore ships about 8.3 ms more sound than
-    picture. Concatenate two and the second seam is out by 16.7 ms, three
-    and it is 25 ms, and the error grows without bound down a chain. It
-    reads as a faint dampening at the first join and a short click at
-    later ones. Truncating the tail to exactly frames/fps stops it
-    accumulating.
+    so the grid rarely lands on a frame boundary. It rounds to the
+    NEAREST step, which means a clip ships either about 8.3 ms more sound
+    than picture or about 8.3 ms less, depending on its length:
+
+        frames % 3 == 0   exact
+        frames % 3 == 1   124 wants 206.67 steps, gets 207, sound is long
+        frames % 3 == 2   260 wants 433.33 steps, gets 433, sound is short
+
+    Either way the error compounds. Concatenate two clips and the second
+    seam is out by 16.7 ms, three and it is 25 ms, and it grows without
+    bound down a chain. It reads as a faint dampening at the first join
+    and a short click at later ones. Matching the tail to exactly
+    frames/fps stops it accumulating: a long tail is truncated, a short
+    one is zero-padded. The padded samples are sound the model never
+    generated, so silence is the only honest fill.
     """
 
     @classmethod
@@ -671,10 +738,13 @@ class MiniMaxH3MotionContextTrim:
                                "Create Video."}),
                 "match_tail": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Truncate the audio so its duration equals "
-                               "frames/fps exactly. H3 rounds its audio grid up, "
-                               "so each clip carries about 8ms of extra sound "
-                               "that accumulates at every join in a chain."}),
+                    "tooltip": "Make the audio duration equal frames/fps "
+                               "exactly, trimming a long tail or padding a "
+                               "short one with silence. H3 rounds its audio "
+                               "grid to the nearest step, so each clip "
+                               "carries about 8ms too much or too little "
+                               "sound, which accumulates at every join in a "
+                               "chain."}),
             },
         }
 
@@ -719,9 +789,23 @@ class MiniMaxH3MotionContextTrim:
                               "(%.2fms) so audio matches %d frames exactly",
                               over, over / sr * 1000.0, frames_left)
                 elif have < want:
-                    _LOG.warning("h3_motion_context: audio is %.2fms shorter than "
-                                 "%d frames; leaving the tail alone",
-                                 (want - have) / sr * 1000.0, frames_left)
+                    # H3 rounds to the nearest audio step, so a third of
+                    # clip lengths ship slightly LESS sound than picture
+                    # rather than more. The missing samples are sound
+                    # that was never generated, so zero is the honest
+                    # fill; anything else would fabricate or attenuate
+                    # real content to hide a seam. Leaving it short
+                    # instead drifts every later clip earlier, and unlike
+                    # the long case that error compounds down the chain.
+                    # This also restores what the vae path assumes when
+                    # it sets overhang to 0.
+                    missing = want - have
+                    waveform = torch.nn.functional.pad(waveform,
+                                                       (0, missing))
+                    _LOG.info("h3_motion_context: tail padded %d zero "
+                              "samples (%.2fms) so audio matches %d "
+                              "frames exactly",
+                              missing, missing / sr * 1000.0, frames_left)
 
             out_audio = {"waveform": waveform, "sample_rate": sr}
             _LOG.info("h3_motion_context: %d frames / %.4fs picture, %.4fs sound, "

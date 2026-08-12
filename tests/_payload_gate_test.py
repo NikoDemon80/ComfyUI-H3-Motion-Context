@@ -14,10 +14,13 @@ stock overwrite, then checks four cases:
   4. one mechanism only                -> untouched either way
 """
 
+import os
 import sys
 import types
 
-_PKG = __file__.rsplit("/", 2)[0]
+# the package dir, one level up. os.path, not a "/" rsplit: __file__ uses
+# backslashes on Windows and the rsplit silently kept the full path
+_PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _PKG)
 
 MC_KEY = "motion_context_index"

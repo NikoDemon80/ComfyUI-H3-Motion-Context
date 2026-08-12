@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-h3-motion-context"
-description = "Clip chaining for MiniMax H3 in ComfyUI: pin the tail of the previous clip, picture and sound, so the next clip genuinely continues it. Runtime patches only, applied on first use and gated to this pack's own graphs. Node ids MiniMaxH3MotionContext, MiniMaxH3MotionContextTrim, MiniMaxH3MotionContextSaveLatent, MiniMaxH3MotionContextLoadLatent."
-version = "0.2.0"
+description = "Clip chaining for MiniMax H3 in ComfyUI: pin the tail of the previous clip, picture and sound, so the next clip genuinely continues it. Runtime patches only, applied on first use and gated to this pack's own graphs. Node ids MiniMaxH3MotionContext, MiniMaxH3MotionContextTrim, MiniMaxH3MotionContextSaveLatent, MiniMaxH3MotionContextLoadLatent, MiniMaxH3MotionContextSeamProbe."
+version = "0.3.0"
 license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.10"

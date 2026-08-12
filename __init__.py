@@ -28,6 +28,13 @@ change produces a clear error rather than a silently wrong render.
 import logging
 
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from .probe_node import (
+    NODE_CLASS_MAPPINGS as _PROBE_CLASSES,
+    NODE_DISPLAY_NAME_MAPPINGS as _PROBE_NAMES,
+)
+
+NODE_CLASS_MAPPINGS.update(_PROBE_CLASSES)
+NODE_DISPLAY_NAME_MAPPINGS.update(_PROBE_NAMES)
 
 logging.getLogger("h3_motion_context").info(
     "h3_motion_context: nodes registered. ComfyUI patches install on the "

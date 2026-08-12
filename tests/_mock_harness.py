@@ -53,10 +53,17 @@ Checks:
 """
 
 import importlib
+import os
 import sys
 import types
 
 import numpy as np
+
+# load_patch imports patch_layout by name, so the package dir has to be on
+# sys.path. Running this file directly puts tests/ there, not the package
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PKG_DIR not in sys.path:
+    sys.path.insert(0, _PKG_DIR)
 
 FRAME_RESCALE = 5.0 / 3.0
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
@@ -190,6 +197,20 @@ def make_mm(ref_advance_factor=1.0, audio_rows_per_step=2):
 def make_torch():
     t = types.ModuleType("torch")
     t.equal = lambda a, b: a.shape == b.shape and bool(np.array_equal(a, b))
+
+    # nodes.py pads a short audio tail with torch.nn.functional.pad. Only
+    # the trailing-last-dim form is used, which is what this covers.
+    def _pad(x, pad, mode="constant", value=0.0):
+        before, after = int(pad[0]), int(pad[1])
+        widths = [(0, 0)] * (x.a.ndim - 1) + [(before, after)]
+        return type(x)(np.pad(x.a, widths, mode="constant",
+                              constant_values=value))
+
+    functional = types.ModuleType("torch.nn.functional")
+    functional.pad = _pad
+    nn = types.ModuleType("torch.nn")
+    nn.functional = functional
+    t.nn = nn
     return t
 
 

@@ -124,6 +124,20 @@ Nothing to configure. Worth mentioning only because older versions
 overwrote that list, so turning chaining on quietly threw your references
 away.
 
+### Keeping a last-frame target
+
+Wire `last_frame` on the stock conditioning node as usual and put this
+node after it. The anchor is kept and pinned alongside the head: the
+pinned run decides how the clip starts, your image decides where it
+ends. Its coordinates get the same layout compensation as the pinned
+frames, so it stays put when references are in the graph.
+
+A `first_frame` anchor is dropped, with a warning. The pinned head owns
+those frames, and a second block pinned at the same instant with
+different content would fight it. Older versions silently replaced both
+anchors, so if a chain graph carried a last-frame target before this
+version, it never reached the model.
+
 ## Settings
 
 Two, because everything else had exactly one right answer.
@@ -138,8 +152,11 @@ frames you throw away. **Use 22.**
 **audio_context_length** - frames of tail audio to pin, independent of the
 picture window. It ends at the same instant as the pinned video, so this
 only controls how far back the sound reaches. 0 follows context_length.
-**Use 22** to line it up with a 22-frame picture window. Longer windows
-(44, 96) are legal but nobody has rendered one.
+**Use 24**: that is exactly one second of sound, and any multiple of 3
+lands exactly on the model's 40 Hz audio grid (a frame is 5/3 of an
+audio step), so the window is pinned at precisely the width you asked
+for. Off-grid values are widened to the nearest whole step. Increments
+of 24 keep whole seconds: 48 pins the last two.
 
 Everything else is fixed: the pinned run is encoded in one VAE call, it
 sits at the head of the clip where the Trim node removes it, and the
@@ -271,27 +288,29 @@ on it.
 
 ## Recommended starting point
 
-`context_length 22`, `audio_context_length 22`, `context_latent` wired
+`context_length 22`, `audio_context_length 24`, `context_latent` wired
 through the Save/Load Latent pair, Trim node wired for picture and sound
 with `match_tail` on, Spectrum off. Every "it works" in this README means
 that config.
 
 ## Testing
 
-Six scripts, all runnable without ComfyUI or a GPU.
+Seven scripts, all runnable without ComfyUI or a GPU.
 
 ```
 python tests/_mock_harness.py        # patch logic against a fake stock model
 python tests/_node_smoke_test.py     # the node end to end, refs + save/load
 python tests/_payload_gate_test.py   # unrelated H3 graphs come out unchanged
+python tests/_probe_node_test.py     # the seam probe node, joins with known answers
 python tests/seam_probe.py A.flac B_untrimmed.flac    # is the join real continuation?
 python tests/level_step.py clip*.flac                 # does the level or room tone jump?
 python tests/freeze_detect.py clip*.mp4               # did a held shot render as a still?
 ```
 
-The first three print their checks and end with a pass line. The other three
-measure real output and each takes `--self-test` to check its own math on
-made-up data first.
+The first four print their checks and end with a pass line. The other
+three measure real output; `level_step` and `freeze_detect` take
+`--self-test` to check their own math on made-up data first, and
+`seam_probe`'s math is what `_probe_node_test.py` exercises.
 
 The three measurement scripts ask different questions and a join can fail
 any one on its own. `seam_probe` is timing: is the audio the same waveform
@@ -302,6 +321,26 @@ is anything happening in that shot.
 For `seam_probe` and `level_step`, give them the UNTRIMMED audio of the new
 clip. Branch the audio decode to a second Save Audio node alongside the
 Trim.
+
+### Measuring a join in-graph
+
+The H3 Motion Context Seam Probe node runs the same measurements inside
+the graph, where the seam position is known exactly rather than inferred
+from file ends (that inference is where the CLI probe's phantom ~8 ms lag
+came from). Wire it inline between the audio VAE decode and the Trim
+node:
+
+```
+clip_a_latent     the same latent wired into context_latent
+audio_vae         the same audio VAE
+clip_b_untrimmed  this clip's audio off the VAE decode, before the trim
+trim_frames       from the Motion Context node, same value the Trim gets
+```
+
+The audio output is the input unchanged, so it drops into an existing
+chain without changing the render. The report goes to a Preview Text
+node: lag, correlation, broadband and floor steps, judged against the
+same thresholds the CLI scripts document.
 
 ## Upgrading
 
@@ -344,8 +383,9 @@ Open an issue.
 |---|---|
 | `patch_layout.py` | Lifts the first/last-only pinned frame restriction, moves pinned audio onto the clip's timeline, keeps everything lined up when references shift the layout. Self-tests at startup. |
 | `patch_payload.py` | Lets pinned video and pinned audio coexist. Stock code let one overwrite the other. Only applies to graphs using this pack. |
-| `nodes.py` | The four nodes: Motion Context, Trim, and the latent Save/Load pair. |
+| `nodes.py` | The four core nodes: Motion Context, Trim, and the latent Save/Load pair. |
+| `probe_node.py` | The Seam Probe node: measures a join in-graph, with the seam at a known sample instead of inferred from file ends. |
 | `tests/seam_probe.py` | Is a join's audio a real continuation, a sound-alike, or drifting. |
 | `tests/level_step.py` | Level and room-tone continuity at each join. Also catches sample-rate mismatches. |
 | `tests/freeze_detect.py` | Stretches where the picture stops moving. |
-| `tests/_mock_harness.py`, `tests/_node_smoke_test.py`, `tests/_payload_gate_test.py` | Patch and node tests, numpy only. |
+| `tests/_mock_harness.py`, `tests/_node_smoke_test.py`, `tests/_payload_gate_test.py`, `tests/_probe_node_test.py` | Patch and node tests, numpy only. |
