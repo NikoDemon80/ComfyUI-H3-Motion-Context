@@ -367,6 +367,11 @@ same thresholds the CLI scripts document.
 
 ## Upgrading
 
+[CHANGELOG.md](CHANGELOG.md) lists what changed in each release and which
+ComfyUI H3 layout it works with. Worth a look before opening an issue or
+starting a fork: several fixes people have rebuilt from scratch were
+already in an earlier release.
+
 The node's widgets changed. ComfyUI stores widget values by position, so a
 workflow saved against an older version will load its numbers into the
 wrong slots. Delete the Motion Context node, add it again and rewire it.
@@ -412,3 +417,4 @@ Open an issue.
 | `tests/level_step.py` | Level and room-tone continuity at each join. Also catches sample-rate mismatches. |
 | `tests/freeze_detect.py` | Stretches where the picture stops moving. |
 | `tests/_mock_harness.py`, `tests/_node_smoke_test.py`, `tests/_payload_gate_test.py`, `tests/_probe_node_test.py` | Patch and node tests, numpy only. |
+| `CHANGELOG.md` | What changed in each release, and which ComfyUI H3 layout it works with. |
