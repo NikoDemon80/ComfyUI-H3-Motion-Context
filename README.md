@@ -21,6 +21,21 @@ check in ComfyUI that rejected any pinned frame other than the first or
 last. The math already worked for everything in between. This lifts that
 check.
 
+ComfyUI 0.33 lifted it upstream too, and added an Add Guide for MiniMax H3
+node that anchors an image, a short clip or audio at any frame. If that is
+all you need, use it. You do not need this pack for it.
+
+What is still here: the previous clip's tail is sliced straight out of its
+latent, with no decode, no resize and no re-encode, which is where the
+colour drift and softening down a long chain come from. And the pinned
+audio window ENDS at the join and reaches backwards, so the model
+continues your soundtrack rather than starting something that sounds like
+it. Add Guide anchors audio forwards from the anchor frame, which is a
+different thing and audibly so on anything with a beat.
+
+The pack runs on 0.32 and 0.33 and produces identical coordinates on
+either, so a graph renders the same across the update.
+
 Audio was the harder half, and it's the more useful half, since H3
 generates picture and sound together. See "Why the audio needed work"
 below if you care how.
@@ -40,9 +55,14 @@ installed changes nothing about your other H3 workflows. The first time
 you chain a clip you'll see:
 
 ```
-h3_motion_context: interior keyframe anchors enabled
+h3_motion_context: interior keyframe anchors enabled (ComfyUI 0.33 or newer, stock places anchors itself)
 h3_motion_context: keyframe/ref coexistence enabled
 ```
+
+On ComfyUI 0.32 or older the first line ends `(ComfyUI 0.32 or older,
+stock rejects interior anchors)` instead. The patch reads the layout
+constructor's signature to work out which it is looking at, so a fork
+reporting an odd version number still gets the right answer.
 
 Anything else and the node refuses to run. The reason is logged.
 
@@ -280,7 +300,10 @@ perceptual results are one person's renders.
 **ComfyUI's H3 support is young.** These patches depend on the current
 shape of it. They check their assumptions at startup and shut down if
 something moved, so the failure mode after an update is "the node won't
-run," not bad output.
+run," not bad output. ComfyUI 0.33 is the worked example: it changed the
+layout constructor, and 0.3.0 of this pack refused to run until 0.3.1
+caught up. Annoying, but the alternative was joins landing at the wrong
+instant with nothing to tell you.
 
 **License.** The H3 community license reportedly doesn't currently cover
 the EU, UK, Korea or the US. Check for yourself before shipping anything
@@ -381,7 +404,7 @@ Open an issue.
 
 | File | Role |
 |---|---|
-| `patch_layout.py` | Lifts the first/last-only pinned frame restriction, moves pinned audio onto the clip's timeline, keeps everything lined up when references shift the layout. Self-tests at startup. |
+| `patch_layout.py` | Places pinned frames at their real time coordinates, moves pinned audio onto the clip's timeline, keeps everything lined up when references shift the layout. Also lifts the first/last-only restriction on ComfyUI 0.32 and older, where stock still enforces it. Self-tests before it installs. |
 | `patch_payload.py` | Lets pinned video and pinned audio coexist. Stock code let one overwrite the other. Only applies to graphs using this pack. |
 | `nodes.py` | The four core nodes: Motion Context, Trim, and the latent Save/Load pair. |
 | `probe_node.py` | The Seam Probe node: measures a join in-graph, with the seam at a known sample instead of inferred from file ends. |

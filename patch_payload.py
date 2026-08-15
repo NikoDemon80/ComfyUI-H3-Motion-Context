@@ -87,11 +87,18 @@ def _patched_extra_conds(self, **kwargs):
                      "keyframe latents may have been overwritten by refs")
         return out
 
-    kf_video = [kf["latent"] for kf in keyframes if "latent" in kf]
+    kf_video = [kf["latent"] for kf in keyframes if kf.get("latent") is not None]
     ref_video = [r["latent"] for r in refs if "latent" in r]
     payload["cond_video_latents"] = kf_video + ref_video
-    payload["cond_audio_latents"] = [r["audio_latent"] for r in refs
-                                     if r.get("audio_latent") is not None]
+    # ComfyUI 0.33 lets a keyframe carry an audio latent of its own, and lays
+    # its rows out ahead of the reference rows. Rebuilding this list from the
+    # refs alone would drop it and leave every audio cond row filled with the
+    # wrong content. On 0.32 no keyframe has one and the first list is empty.
+    kf_audio = [kf["audio_latent"] for kf in keyframes
+                if kf.get("audio_latent") is not None]
+    ref_audio = [r["audio_latent"] for r in refs
+                 if r.get("audio_latent") is not None]
+    payload["cond_audio_latents"] = kf_audio + ref_audio
     # only write frame_count when we actually have one. This wrapper fires
     # for ANY graph combining keyframes and refs, not just ours; a graph
     # that reaches here without minimax_frame_count may have a valid value

@@ -32,6 +32,20 @@ four position columns and labelled every reference block `ref`. All three
 were wrong, and stopped mattering only because nothing read the segment
 table. Anything that does read it needs this to be faithful.
 
+`make_mm(modern=True)` builds the ComfyUI 0.33 shape instead. It differs
+in four ways that the patch has to cope with:
+
+  no frame_count   the constructor lost the parameter along with the
+                   first/last restriction it policed
+  cursor first     the target origin is worked out from the reference
+                   spans BEFORE the keyframes are laid out, so stock
+                   compensates anchors for references by itself
+  general formula  cond_t = cursor + FRAME_RESCALE * resolved_frame_index
+                   at every index, interior ones included
+  latent driven    a keyframe emits a cond segment only if it carries a
+                   video latent, sized by that latent's step count, and a
+                   separate cond_audio segment if it carries an audio one
+
 Checks:
   1. apply_patch succeeds against the faithful layout
   2. interior anchors build, and reference compensation lands
@@ -50,6 +64,17 @@ Checks:
      way is recognised too, and refused rather than stacked on. Several
      H3 packs lift the same restriction independently and they cannot
      both own the constructor.
+ 10. the patch applies against the 0.33 constructor and recognises which
+     shape it is looking at
+ 11. anchors and the audio move land on identical coordinates under both
+     shapes, so a graph produces the same render either side of the
+     ComfyUI update
+ 12. a stock Add Guide anchor sharing the graph contributes a cond_audio
+     segment and no cond segment. The anchors must still pair with the
+     right rows and the guide's own rows must be left where stock put them
+ 13. the mixed-keyframe guard is retired on 0.33, where stock compensates
+     untagged keyframes itself, rather than refusing a legitimate graph
+ 14. the audio row count check still bites on 0.33
 """
 
 import importlib
@@ -107,8 +132,19 @@ def _video_grid(vt, frame, cursor):
     return g.reshape(-1, 3)
 
 
-def make_mm(ref_advance_factor=1.0, audio_rows_per_step=2):
+class FakeLatent:
+    """Stands in for a latent. The layout reads only its shape."""
+
+    def __init__(self, shape):
+        self.shape = shape
+
+
+def make_mm(ref_advance_factor=1.0, audio_rows_per_step=2, modern=False):
     """Build a fake comfy.ldm.minimax.model.
+
+    modern=True builds the ComfyUI 0.33 constructor instead of the 0.32
+    one. Both are here rather than one replacing the other: the pack has
+    to keep working on both, and the point of check 11 is that they agree.
 
     ref_advance_factor != 1 simulates an upstream change to how an audio
     reference advances the cursor. audio_rows_per_step != 2 simulates a
@@ -119,9 +155,21 @@ def make_mm(ref_advance_factor=1.0, audio_rows_per_step=2):
     mm.FRAME_PER_TOKEN = FRAME_PER_TOKEN
     mm._video_t_spans = _video_t_spans
 
-    class PackedLayout:
-        def __init__(self, text_len, latent_t, latent_h, latent_w, audio_t,
-                     keyframes=None, refs=None, frame_count=None):
+    def _ref_t_span(blk):
+        # must agree with what the reference loop below actually does,
+        # including the simulated drift, or the fake is not self-consistent
+        kind = blk["kind"]
+        if kind == "image":
+            return 1.0
+        if kind == "audio":
+            return float(blk["ref_audio_t"]) * ref_advance_factor
+        if kind in ("video", "video_audio"):
+            return max(float(blk["ref_audio_t"]),
+                       sum(_video_t_spans(blk["latent_t"])))
+        raise ValueError("mock: unsupported ref kind %r" % kind)
+
+    def _build(self, text_len, latent_t, latent_h, latent_w, audio_t,
+               keyframes, refs, frame_count):
             frame = _frame_grid(latent_h, latent_w)
             frame_rows = frame.shape[0]
             segs, blocks = [], []
@@ -135,9 +183,29 @@ def make_mm(ref_advance_factor=1.0, audio_rows_per_step=2):
             emit("text", g)
 
             spans = _video_t_spans(latent_t)
+            # 0.33 works the target origin out before laying the anchors
+            # down, so they are compensated for references by stock itself
+            origin = float(text_len)
+            if modern:
+                for blk in (refs or []):
+                    origin += _ref_t_span(blk)
+
             for kf in (keyframes or []):
                 p = kf["resolved_frame_index"]
-                # faithful stock: computed from text_len, NOT the cursor
+                if modern:
+                    cond_t = origin + FRAME_RESCALE * p
+                    video_latent = kf.get("latent")
+                    if video_latent is not None:
+                        emit("cond", _video_grid(video_latent.shape[2],
+                                                 frame, cond_t))
+                    audio_latent = kf.get("audio_latent")
+                    if audio_latent is not None:
+                        emit("cond_audio",
+                             _audio_grid(cond_t, audio_latent.shape[-1],
+                                         audio_rows_per_step))
+                    continue
+                # faithful 0.32 stock: computed from text_len, NOT the
+                # cursor, and refusing anything but the two endpoints
                 if p == 0:
                     t = float(text_len)
                 elif frame_count is not None and p == frame_count - 1:
@@ -190,6 +258,24 @@ def make_mm(ref_advance_factor=1.0, audio_rows_per_step=2):
             self.seq_len = off
             self.position_ids = np.concatenate(blocks)
 
+    # Two real signatures over one body, not one signature with **kwargs.
+    # The patch decides which ComfyUI it is on by inspecting this
+    # signature, and it has to raise the same TypeError 0.33 raises, so
+    # the difference has to be genuine.
+    if modern:
+        class PackedLayout:
+            def __init__(self, text_len, latent_t, latent_h, latent_w,
+                         audio_t, keyframes=None, refs=None):
+                _build(self, text_len, latent_t, latent_h, latent_w, audio_t,
+                       keyframes, refs, None)
+    else:
+        class PackedLayout:
+            def __init__(self, text_len, latent_t, latent_h, latent_w,
+                         audio_t, keyframes=None, refs=None,
+                         frame_count=None):
+                _build(self, text_len, latent_t, latent_h, latent_w, audio_t,
+                       keyframes, refs, frame_count)
+
     mm.PackedLayout = PackedLayout
     return mm
 
@@ -228,6 +314,10 @@ def load_patch(mm):
 
 TEXT_LEN, LATENT_T, LH, LW, AUDIO_T = 7, 7, 22, 38, 16
 FC = sum(FRAME_PER_TOKEN[k % 5] for k in range(LATENT_T))
+# 0.33 sizes a cond segment from the keyframe's own latent and emits
+# nothing for a keyframe without one. 0.32 never looks at the key, so the
+# same keyframes drive both shapes.
+VIDEO_STUB = FakeLatent((1, 1, 1, LH, LW))
 
 
 def _cond_ts(layout):
@@ -244,7 +334,8 @@ def main():
     print("1. self-test passes against the faithful stock layout")
 
     # 2. interior anchors build, reference compensation lands
-    run = [{"resolved_frame_index": 0, pl.MC_KEY: i} for i in range(4)]
+    run = [{"resolved_frame_index": 0, pl.MC_KEY: i, "latent": VIDEO_STUB}
+           for i in range(4)]
     lay = mm.PackedLayout(TEXT_LEN, LATENT_T, LH, LW, AUDIO_T,
                           keyframes=run, frame_count=FC)
     ts = _cond_ts(lay)
@@ -427,7 +518,83 @@ def main():
     print("9. an unrelated pack's wrapper is detected and refused, whether "
           "it hides behind functools.wraps or not")
 
+    modern_checks(run, marked, refs_marked, rt, end_frame, ts3)
+
     print("all checks passed")
+
+
+def modern_checks(run, marked, refs_marked, rt, end_frame, legacy_ts):
+    """The same patch against the ComfyUI 0.33 constructor.
+
+    `legacy_ts` is where the anchors landed under 0.32 in check 3, so the
+    parity assertion compares against a number this file actually measured
+    rather than one it recomputes with the formula under test.
+    """
+    # 10. the constructor that broke 0.3.0 must be recognised, not guessed
+    mm = make_mm(modern=True)
+    pl = load_patch(mm)
+    try:
+        mm.PackedLayout(TEXT_LEN, LATENT_T, LH, LW, AUDIO_T,
+                        keyframes=run, frame_count=FC)
+    except TypeError as e:
+        assert "frame_count" in str(e), e
+    else:
+        raise AssertionError("the modern fake still accepts frame_count")
+    assert pl.apply_patch(), "self-test failed against the 0.33 constructor"
+    assert pl._stock_frame_count is False, \
+        "the patch thinks 0.33 still takes frame_count"
+    print("10. 0.33 constructor recognised by signature, patch applied")
+
+    # 11. same graph, same coordinates, either side of the update
+    lay = mm.PackedLayout(TEXT_LEN, LATENT_T, LH, LW, AUDIO_T,
+                          keyframes=run, refs=refs_marked)
+    origin = pl._target_origin(lay)
+    ts = _cond_ts(lay)
+    assert np.allclose(ts, [origin + FRAME_RESCALE * i for i in range(4)]), ts
+    assert np.allclose(ts, legacy_ts), (ts, legacy_ts)
+    a, _ = pl._ref_segment_map(lay, refs_marked)[2]["ref_audio"]
+    got_end = float(lay.position_ids[a, 0]) + rt
+    assert abs(got_end - (origin + FRAME_RESCALE * end_frame)) < 1e-9, got_end
+    print("11. anchors at %s and the audio window ending at target frame %d, "
+          "identical to the 0.32 result" % ([round(t, 4) for t in ts],
+                                            end_frame))
+
+    # 12. a stock Add Guide anchor in the same graph. It emits cond_audio
+    # and no cond, so pairing cond spans against the raw keyframe list
+    # would miscount and write our coordinates onto its rows.
+    guide = {"resolved_frame_index": 3, "audio_latent": FakeLatent((1, 1, 2, 4))}
+    lay = mm.PackedLayout(TEXT_LEN, LATENT_T, LH, LW, AUDIO_T,
+                          keyframes=run + [guide], refs=refs_marked)
+    origin = pl._target_origin(lay)
+    assert _cond_ts(lay) == ts, "the stock guide moved our anchors"
+    ca = [(s, e) for s, e, k in lay.segments if k == "cond_audio"]
+    assert len(ca) == 1, lay.segments
+    want = origin + FRAME_RESCALE * 3
+    assert abs(float(lay.position_ids[ca[0][0], 0]) - want) < 1e-9, \
+        "the stock guide's own rows were disturbed"
+    print("12. a stock audio guide alongside ours: our anchors unmoved, its "
+          "cond_audio rows left at target frame 3 where stock put them")
+
+    # 13. the mixed-keyframe guard is 0.32 only. There, stock computed an
+    # untagged keyframe from text_len and never compensated it, so mixing
+    # disagreed under a reference. 0.33 compensates it itself, and refusing
+    # would block a Ref2VA graph carrying a stock anchor.
+    untagged = {"resolved_frame_index": 2, "latent": VIDEO_STUB}
+    lay = mm.PackedLayout(TEXT_LEN, LATENT_T, LH, LW, AUDIO_T,
+                          keyframes=run[:2] + [untagged], refs=[dict(marked)])
+    origin = pl._target_origin(lay)
+    mixed_ts = _cond_ts(lay)
+    assert np.allclose(mixed_ts, [origin, origin + FRAME_RESCALE,
+                                  origin + FRAME_RESCALE * 2]), mixed_ts
+    print("13. mixed stock/MC keyframes accepted on 0.33 and the untagged "
+          "one lands on the same timeline as ours")
+
+    # 14. the row count check has to keep biting on the new shape too
+    bad = make_mm(modern=True, audio_rows_per_step=3)
+    pl_bad = load_patch(bad)
+    assert not pl_bad.apply_patch(), \
+        "self-test passed against a changed audio row count on 0.33"
+    print("14. changed audio row count still caught on 0.33")
 
 
 if __name__ == "__main__":

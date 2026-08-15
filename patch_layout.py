@@ -35,6 +35,7 @@ That keeps the patch surface to one attribute we can verify rather than a
 copy of a 90-line constructor that would rot on the next ComfyUI change.
 """
 
+import inspect
 import logging
 
 import torch
@@ -53,6 +54,42 @@ _LOG = logging.getLogger("h3_motion_context")
 
 _orig_init = None
 _applied = False
+
+# ComfyUI 0.33 dropped frame_count from PackedLayout.__init__ along with the
+# first/last-only restriction it existed to police. Stock now positions a
+# keyframe at cursor + FRAME_RESCALE * resolved_frame_index, which is the
+# general formula this patch was written to install, with the reference
+# compensation already folded into cursor.
+#
+# So on 0.33 the patch has much less to do, but it still has one job stock
+# cannot express: our keyframes ride at resolved_frame_index 0 with the real
+# position under MC_KEY, and the marked audio reference still has to be moved
+# onto the target timeline. Both work unchanged against the new constructor.
+#
+# Probed once, from the ORIGINAL constructor, at the moment we capture it.
+# Not from a ComfyUI version string: a signature is the thing we actually
+# depend on, and it is the thing that will tell us the truth in a fork.
+_stock_frame_count = None
+
+
+def _probe_frame_count(init):
+    """Does this PackedLayout constructor still take frame_count?"""
+    try:
+        return "frame_count" in inspect.signature(init).parameters
+    except (TypeError, ValueError):
+        names = getattr(getattr(init, "__code__", None), "co_varnames", ())
+        return "frame_count" in names
+
+
+def _call_orig(layout, text_len, latent_t, latent_h, latent_w, audio_t,
+               keyframes=None, refs=None, frame_count=None):
+    """Call the stock constructor in whichever shape this ComfyUI has."""
+    if _stock_frame_count:
+        return _orig_init(layout, text_len, latent_t, latent_h, latent_w,
+                          audio_t, keyframes=keyframes, refs=refs,
+                          frame_count=frame_count)
+    return _orig_init(layout, text_len, latent_t, latent_h, latent_w,
+                      audio_t, keyframes=keyframes, refs=refs)
 
 
 REF_SEGMENT_KINDS = ("ref_img", "ref_audio")
@@ -146,6 +183,24 @@ def _ref_segment_map(layout, refs):
     return out
 
 
+def _cond_keyframes(keyframes):
+    """The keyframes that produce a cond (video) segment, in emission order.
+
+    On 0.32 every keyframe emitted one, so the list is the list. On 0.33 a
+    keyframe emits a cond segment only if it carries a video latent, and it
+    emits a separate cond_audio segment if it carries an audio latent. An
+    audio-only guide from the stock Add Guide node therefore contributes no
+    cond segment, and pairing the cond spans against the raw keyframe list
+    would either miscount or write our coordinates onto somebody else's rows.
+
+    cond_audio rows are deliberately left alone. Stock already places them at
+    the anchor's real index off the target origin, which is where they belong.
+    """
+    if _stock_frame_count:
+        return list(keyframes)
+    return [kf for kf in keyframes if kf.get("latent") is not None]
+
+
 def _cond_t(text_len, latent_t, frame_count, p):
     """Time coordinate for a keyframe anchored at pixel frame p.
 
@@ -171,23 +226,30 @@ def _fixup(layout, text_len, latent_t, frame_count, keyframes, refs=None):
     actually landed, not recomputed from the block list.
     """
     offset = _target_origin(layout) - float(text_len)
-    if offset and any(kf.get(MC_KEY) is None for kf in keyframes):
+    if _stock_frame_count and offset and any(
+            kf.get(MC_KEY) is None for kf in keyframes):
         # keyframes without MC_KEY are left exactly as stock built them,
-        # which means they do NOT get the reference compensation. Mixing
-        # them with MC keyframes under a reference would slide the stock
-        # anchors relative to ours and to the target. Nothing produces
-        # this today; refuse loudly in case something ever does.
+        # which on 0.32 means they do NOT get the reference compensation.
+        # Mixing them with MC keyframes under a reference would slide the
+        # stock anchors relative to ours and to the target.
+        #
+        # 0.33 compensates them itself: its cursor starts past the reference
+        # spans, so an untagged keyframe lands at exactly the coordinate this
+        # code would have written for it. The disagreement the guard exists
+        # to catch cannot arise there, and keeping it would refuse a Ref2VA
+        # graph carrying a stock Add Guide anchor, which is legitimate.
         raise RuntimeError(
             "h3_motion_context: stock and motion-context keyframes mixed in "
             "one graph alongside a ref; their coordinates would disagree. "
             "Give every keyframe a %s entry or remove the refs." % MC_KEY)
     cond_spans = [(a, b) for a, b, kind in layout.segments if kind == "cond"]
-    if len(cond_spans) != len(keyframes):
+    emitters = _cond_keyframes(keyframes)
+    if len(cond_spans) != len(emitters):
         raise RuntimeError(
             "h3_motion_context: expected %d cond segments, layout has %d. "
             "Refusing to rewrite positions."
-            % (len(keyframes), len(cond_spans)))
-    for (a, b), kf in zip(cond_spans, keyframes):
+            % (len(emitters), len(cond_spans)))
+    for (a, b), kf in zip(cond_spans, emitters):
         p = kf.get(MC_KEY)
         if p is None:
             continue
@@ -268,7 +330,15 @@ def _fixup_audio(layout, text_len, refs):
 
 def _patched_init(self, text_len, latent_t, latent_h, latent_w, audio_t,
                   keyframes=None, refs=None, frame_count=None):
-    _orig_init(self, text_len, latent_t, latent_h, latent_w, audio_t,
+    # frame_count stays in the signature on every version. On 0.33 nothing
+    # passes it, and dropping it here would break 0.32, where model_base
+    # still does. Null it when stock cannot take it so _cond_t uses the
+    # general formula rather than the old endpoint expression: stock 0.33
+    # computes the endpoint with the same multiply we do, and the two forms
+    # differ in the last bits.
+    if not _stock_frame_count:
+        frame_count = None
+    _call_orig(self, text_len, latent_t, latent_h, latent_w, audio_t,
                keyframes=keyframes, refs=refs, frame_count=frame_count)
     has_mc_kf = bool(keyframes) and any(
         kf.get(MC_KEY) is not None for kf in keyframes)
@@ -279,6 +349,13 @@ def _patched_init(self, text_len, latent_t, latent_h, latent_w, audio_t,
     if has_mc_audio:
         _fixup_audio(self, text_len, refs)
     # neither marked: stock graph, leave it exactly as built
+
+
+class _StubLatent:
+    """Stands in for a latent in the self-test. The layout reads only shape."""
+
+    def __init__(self, shape):
+        self.shape = shape
 
 
 def _self_test():
@@ -294,13 +371,28 @@ def _self_test():
     """
     text_len, latent_t, lh, lw, audio_t = 7, 7, 22, 38, 16
     frame_count = sum(mm.FRAME_PER_TOKEN[k % 5] for k in range(latent_t))
+    # 0.33 reads the keyframe's own latent to decide how many rows the cond
+    # segment gets, and emits nothing at all for a keyframe without one. Only
+    # the shape is read, never the contents, so a stand-in carrying one is
+    # enough and nothing has to be allocated. 0.32 never looks at the key.
+    stub = _StubLatent((1, 1, 1, lh, lw))
+
+    def kfs(*positions):
+        return [{"resolved_frame_index": 0, MC_KEY: p, "latent": stub}
+                for p in positions]
+
+    # exactly what _patched_init would forward on this version. Handing the
+    # real count to _fixup where stock cannot take it would put the old
+    # endpoint expression back in, and that disagrees with 0.33's multiply in
+    # the last bits, which test 1 is strict enough to catch.
+    fc = frame_count if _stock_frame_count else None
 
     def build(keyframes=None, refs=None, fix=False, move=False):
         lay = mm.PackedLayout.__new__(mm.PackedLayout)
-        _orig_init(lay, text_len, latent_t, lh, lw, audio_t,
-                   keyframes=keyframes, refs=refs, frame_count=frame_count)
+        _call_orig(lay, text_len, latent_t, lh, lw, audio_t,
+                   keyframes=keyframes, refs=refs, frame_count=fc)
         if fix:
-            _fixup(lay, text_len, latent_t, frame_count, keyframes, refs)
+            _fixup(lay, text_len, latent_t, fc, keyframes, refs)
         if move:
             _fixup_audio(lay, text_len, refs)
         return lay
@@ -310,10 +402,9 @@ def _self_test():
                 for a, _, k in lay.segments if k == "cond"]
 
     # 1. the two anchors stock supports must come out bit-identical
-    stock_kf = [{"resolved_frame_index": 0},
-                {"resolved_frame_index": frame_count - 1}]
-    ours_kf = [{"resolved_frame_index": 0, MC_KEY: 0},
-               {"resolved_frame_index": 0, MC_KEY: frame_count - 1}]
+    stock_kf = [{"resolved_frame_index": 0, "latent": stub},
+                {"resolved_frame_index": frame_count - 1, "latent": stub}]
+    ours_kf = kfs(0, frame_count - 1)
     a = build(keyframes=stock_kf)
     b = build(keyframes=ours_kf, fix=True)
     if a.position_ids.shape != b.position_ids.shape:
@@ -324,7 +415,7 @@ def _self_test():
 
     # 2. a consecutive run lands on strictly increasing coordinates inside
     # the span the two endpoints define
-    run = [{"resolved_frame_index": 0, MC_KEY: i} for i in range(4)]
+    run = kfs(*range(4))
     c = build(keyframes=run, fix=True)
     ts = cond_ts(c)
     if len(ts) != len(run):
@@ -411,6 +502,33 @@ def _self_test():
                 "origin %.6f. Reference rows should sit before the target."
                 % (i, hi, origin))
         prev_hi = hi
+
+    if _stock_frame_count:
+        return
+
+    # 7. 0.33 only: a stock audio guide alongside ours. It emits a cond_audio
+    # segment and no cond segment, so the cond spans no longer line up with
+    # the keyframe list one for one. Our anchors must still land where they
+    # did, and the guide's own rows must come through untouched.
+    guide = {"resolved_frame_index": 3,
+             "audio_latent": _StubLatent((1, 1, 2, 4))}
+    h = build(keyframes=run + [guide], fix=True)
+    ts_guide = cond_ts(h)
+    if ts_guide != ts:
+        raise RuntimeError(
+            "a stock audio guide moved our anchors: %s, expected %s"
+            % (ts_guide, ts))
+    ca = [(a0, b0) for a0, b0, k in h.segments if k == "cond_audio"]
+    if len(ca) != 1:
+        raise RuntimeError("expected 1 cond_audio segment, layout has %d"
+                           % len(ca))
+    a0, b0 = ca[0]
+    want = _target_origin(h) + mm.FRAME_RESCALE * 3
+    if abs(float(h.position_ids[a0, 0]) - want) > 1e-9:
+        raise RuntimeError(
+            "the stock audio guide's rows were disturbed: start %.6f, "
+            "stock put them at %.6f"
+            % (float(h.position_ids[a0, 0]), want))
 
 
 def _check_move(before, after, refs, idx, label):
@@ -504,7 +622,7 @@ def _already_patched():
 
 
 def apply_patch():
-    global _orig_init, _applied
+    global _orig_init, _applied, _stock_frame_count
     if _applied:
         return True
     who = _already_patched()
@@ -541,10 +659,12 @@ def apply_patch():
                      "attributes, patch not applied")
         return False
     _orig_init = mm.PackedLayout.__init__
+    _stock_frame_count = _probe_frame_count(_orig_init)
     try:
         _self_test()
     except Exception as exc:
         _orig_init = None
+        _stock_frame_count = None
         _LOG.warning("h3_motion_context: self-test failed (%s), patch not "
                      "applied. Interior keyframe anchors unavailable.", exc)
         _LOG.warning(
@@ -558,7 +678,10 @@ def apply_patch():
         return False
     mm.PackedLayout.__init__ = _patched_init
     _applied = True
-    _LOG.info("h3_motion_context: interior keyframe anchors enabled")
+    _LOG.info("h3_motion_context: interior keyframe anchors enabled (%s)",
+              "ComfyUI 0.32 or older, stock rejects interior anchors"
+              if _stock_frame_count else
+              "ComfyUI 0.33 or newer, stock places anchors itself")
     return True
 
 
