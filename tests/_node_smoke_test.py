@@ -332,16 +332,18 @@ def main():
     else:
         raise AssertionError("mismatched latent did not refuse")
 
-    # nothing wired at all
-    try:
-        run(
-            conditioning=[["c", {}]], vae=VAE(), latent=target,
-            context_length="22", audio_context_length=22)
-    except ValueError as e:
-        assert "nothing to pin" in str(e), str(e)
-        print("nothing wired: refused with a plain reason")
-    else:
-        raise AssertionError("no context at all did not refuse")
+    # nothing wired: first clip of a chain. Pass the conditioning
+    # through and report trim_frames 0 so Trim is a no-op.
+    cond = [["c", {"untouched": True}]]
+    res, trim = run(
+        conditioning=cond, vae=VAE(), latent=target,
+        context_length="22", audio_context_length=22)
+    assert trim == 0, trim
+    assert res is cond
+    assert captured.get("untouched") is True
+    assert "minimax_keyframes" not in captured
+    print("nothing wired: original conditioning passed through, "
+          "trim_frames 0")
 
     # the constants that replaced the widgets must be on the good values
     assert nodes.ENCODE_MODE == "video"
@@ -579,7 +581,7 @@ def main():
     ])}
     (p2,) = saver.save(prev2, "h3_context/clip")
     assert p1 != p2
-    (loaded,) = loader.load("h3_context")  # folder -> newest = p2
+    (loaded,) = loader.load(p2, clip_index=1)  # specific file
     parts = loaded["samples"]
     assert isinstance(parts, list) and len(parts) == 2
     captured.clear()
@@ -590,12 +592,15 @@ def main():
     kf3 = audio_kf()
     want = float(prev2["samples"].parts[1].a[0, 0, 0, -1])
     got = float(kf3["audio_latent"].a[0, 0, 0, -1])
-    assert got == want, (got, want)  # newest save's content came through
+    assert got == want, (got, want)
     assert abs(audio_end() - 22.2) < 1e-6
-    ic1 = loader.IS_CHANGED("h3_context")
+    ic1 = loader.IS_CHANGED(p2, clip_index=1)
     assert isinstance(ic1, str) and p2 in ic1  # cache keys on the real file
-    print("save/load roundtrip: newest of 2 saves loaded, pinned, "
-          "end_frame %.4f, cache key tracks the file" % audio_end())
+    assert loader.IS_CHANGED("h3_context", clip_index=0) == "disabled"
+    (empty,) = loader.load("h3_context", clip_index=0)
+    assert empty is None
+    print("save/load roundtrip: file loaded, pinned, end_frame %.4f, "
+          "index 0 is first-clip/no-context" % audio_end())
 
     # retry safety with indexed slots: generating clip 3, re-rolling it
     # must overwrite slot 3 and always load slot 2, never its own save
@@ -619,9 +624,9 @@ def main():
     (l3,) = loader.load("h3_context", clip_index=2)
     got = float(l3["samples"][1].a[0, 0, 0, 0])
     assert got == 7.0, got  # clip 2's latent, NOT the rejected attempt (8/9)
-    # newest-file mode would have returned the reject: prove the hazard
+    # index 0 is first-clip/no-context: it must not pick up the reject
     (lnew,) = loader.load("h3_context", clip_index=0)
-    assert float(lnew["samples"][1].a[0, 0, 0, 0]) == 9.0
+    assert lnew is None
     # asking for a slot that was never saved says so plainly
     try:
         loader.load("h3_context", clip_index=7)

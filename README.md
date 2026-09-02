@@ -103,21 +103,44 @@ next run:   H3 Motion Context Load Latent -> context_latent
 ```
 
 Both have a `clip_index` and the numbers mean what they say. On Load, the
-clip you're continuing FROM. On Save, the clip this one IS. Making clip 2
-from clip 1: Load 1, Save 2. Don't like it? Queue again, change nothing.
-The retry reloads clip 1 and overwrites clip 2. Happy with it? Bump both
-numbers and move on. Files are named the obvious way,
-`clip_00002.safetensors` is clip 2.
+clip you're continuing FROM. On Save, the clip this one IS. First clip:
+Load 0, Save 1. Making clip 2 from clip 1: Load 1, Save 2.
 
-Leave context unwired for clip 1.
+Load 0 does not read a file. Motion Context then passes the incoming
+conditioning through and reports `trim_frames` 0, so you can leave the
+node enabled for the first clip. Do not mute it.
 
-At `clip_index` 0 the loader grabs the newest file in the folder instead.
-Simpler, but a re-roll then loads its own rejected audio, so don't use it
-for anything you're going to retry. Auto-saved files get a trailing
-underscore (`clip_00002_.safetensors`) because they're numbered by run,
-not by clip, and indexed loading skips them on purpose.
+Do not use queue **run on change** to walk the chain. Each index change is
+a separate graph edit, so two widgets incrementing will queue two runs and
+skip slots. Use **H3 Motion Context Chain** instead of ComfyUI's Run
+button.
 
-You can also point the loader at a specific file, which ignores the index.
+**The Chain node only sees Load and Save if all three sit in the same
+canvas group** (one of those coloured boxes you draw around nodes). If
+they are not grouped together, every button does nothing. Select Load,
+Save, and Chain, then Group Selected (or drop Chain into the existing
+Motion Context group).
+
+- **Run/Re-roll** is the Run button for this graph. It queues at the
+  current Load/Save indices and does not advance them. First clip: leave
+  Load 0 / Save 1 and click it. Hate the result? Click it again; the
+  retry overwrites that slot.
+- **Approve** advances both indices, then queues the next clip once.
+- **Chain** queues at the current Load/Save indices and auto-approves
+  after each successful run. It does not reset the pair first, so you
+  can walk a few clips by hand and then let it take over. Click **Stop**
+  (the same button) to halt the next queue.
+- **Reset** sets Load 0 / Save 1. It does not queue.
+
+Files are named the obvious way, `clip_00002.safetensors` is clip 2.
+
+Auto-saved files (Save at 0) get a trailing underscore
+(`clip_00002_.safetensors`) because they're numbered by run, not by clip,
+and indexed loading skips them on purpose.
+
+You can also point the loader at a specific file when `clip_index` is
+greater than 0; the file is loaded and the index is ignored. Index 0
+never reads a file.
 Its output is only for `context_latent`. Don't wire it into a decode node.
 Stock Save/Load Latent won't work here, it can't handle H3's paired
 video/audio latent.

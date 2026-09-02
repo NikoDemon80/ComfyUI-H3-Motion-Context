@@ -8,6 +8,29 @@ rejected any keyframe anchor other than the first or last frame. That
 landed in ComfyUI 0.34.0. Every release through 0.33.4 has the older
 layout. Each entry below says which of the two it works with.
 
+## 0.5.0 - 2026-09-02
+
+Requires ComfyUI 0.34.0 or newer. Use 0.3.1 on anything older.
+
+#25 by feigo313 is why Load 0 is first-clip/no-context, so Motion Context
+stays enabled from the first clip, and why the Chain node exists: walking
+those indices with run-on-change queues twice and skips slots.
+
+- Load Latent `clip_index` 0 is first-clip/no-context: nothing is read,
+  Motion Context passes the original conditioning through, and
+  `trim_frames` is 0. Leave the node enabled. The chain is Load 0 / Save 1,
+  then Load 1 / Save 2. Positive indices still load that exact slot.
+  The old load-newest meaning of index 0 is gone.
+- H3 Motion Context Chain node: Approve advances Load/Save then queues
+  once, Run/Re-roll repeats the current slot (use it instead of
+  ComfyUI's Run), Chain auto-approves from the current indices, Reset
+  sets 0/1 without queuing. Load, Save, and Chain must share one canvas
+  group or the buttons do nothing. Button clicks do not open the node
+  menu. Do not use queue "run on change" to walk indices.
+- Save Latent can overwrite a slot that Load still has memory-mapped on
+  Windows (os error 1224). Load copies tensors off the file first, and
+  Save writes through a temp file.
+
 ## 0.4.0 - 2026-08-26
 
 Requires ComfyUI 0.34.0 or newer. Use 0.3.1 on anything older.

@@ -38,4 +38,6 @@ logging.getLogger("h3_motion_context").info(
     "h3_motion_context: nodes registered. ComfyUI is not modified; the "
     "layout checks run on the first use of a Motion Context node.")
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+WEB_DIRECTORY = "./web"
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]

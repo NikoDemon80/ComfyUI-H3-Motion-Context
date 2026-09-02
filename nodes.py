@@ -29,6 +29,7 @@ anchor_mode
           what this mode is asking.
 """
 
+import gc
 import logging
 import os
 
@@ -385,6 +386,8 @@ class MiniMaxH3MotionContext:
     def apply(self, conditioning, vae, latent, context_length,
               audio_context_length=24, context_frames=None,
               context_latent=None, audio_vae=None, context_audio=None):
+        if context_latent is None and context_frames is None:
+            return (conditioning, 0)
         encode_mode, anchor_mode = ENCODE_MODE, ANCHOR_MODE
         audio_mode, crop = AUDIO_MODE, CROP
         context_length = int(context_length)
@@ -429,10 +432,6 @@ class MiniMaxH3MotionContext:
             available = _pixel_frames(int(src_video.shape[2]))
             video_src = "latent"
         else:
-            if context_frames is None:
-                raise ValueError(
-                    "h3_motion_context: nothing to pin. Wire context_latent "
-                    "(preferred) or context_frames.")
             available = int(context_frames.shape[0])
             video_src = "pixels"
 
@@ -815,17 +814,11 @@ def _resolve_latent_path(path, clip_index=0):
     """Turn the loader's path input into a concrete file.
 
     Accepts an absolute path, a path relative to ComfyUI's output folder,
-    or a directory (in either form). For a directory:
-
-      clip_index == 0   the NEWEST .safetensors inside is used. Simple,
-                        but NOT retry-safe: re-rolling a clip loads the
-                        rejected attempt's own save (see the node docs).
-                        Its run counter also numbers ATTEMPTS, not clips.
-      clip_index  > 0   exactly that clip's slot is loaded: clip 1 is
-                        *_00001.safetensors. Auto-mode files carry a
-                        trailing underscore (*_00001_.safetensors) and
-                        are never matched, because their numbers count
-                        runs and could hold a reject.
+    or a directory (in either form). For a directory, clip_index must be
+    a positive slot: clip 1 is *_00001.safetensors. Auto-mode files carry
+    a trailing underscore (*_00001_.safetensors) and are never matched,
+    because their numbers count runs and could hold a reject. clip_index 0
+    is handled by the Load node itself (no file, first clip).
     """
     p = (path or "").strip().strip('"').strip("'")
     if not p:
@@ -836,44 +829,59 @@ def _resolve_latent_path(path, clip_index=0):
             return c
         if os.path.isdir(c):
             idx = int(clip_index)
-            if idx > 0:
-                # indexed slots use the natural name: clip 2 lives in
-                # *_00002.safetensors. Auto-mode files carry a trailing
-                # underscore (*_00002_.safetensors) and are deliberately
-                # NOT matched: their numbers count runs, not clips, so a
-                # reject could be sitting in any of them.
-                endings = ("_%05d.safetensors" % idx,
-                           "_clip%03d.safetensors" % idx)  # older versions
-                files = [os.path.join(c, f) for f in os.listdir(c)
-                         if f.endswith(endings)]
-                if not files:
-                    near = [f for f in os.listdir(c)
-                            if f.endswith("_%05d_.safetensors" % idx)]
-                    hint = ""
-                    if near:
-                        hint = (" Found %s, which is an auto-numbered save "
-                                "(trailing underscore = numbered by RUN, so "
-                                "it may be a reject). If it really is clip "
-                                "%d, rename it to drop the trailing "
-                                "underscore: %s" %
-                                (near[0], idx,
-                                 near[0].replace("_%05d_" % idx,
-                                                 "_%05d" % idx)))
-                    raise FileNotFoundError(
-                        "h3_motion_context: no saved latent for clip %d "
-                        "(no *_%05d.safetensors in %s).%s"
-                        % (idx, idx, c, hint))
-            else:
-                files = [os.path.join(c, f) for f in os.listdir(c)
-                         if f.endswith(".safetensors")]
-                if not files:
-                    raise FileNotFoundError(
-                        "h3_motion_context: no saved latents in %s. Run a "
-                        "clip with the Save Latent node first." % c)
+            if idx <= 0:
+                raise FileNotFoundError(
+                    "h3_motion_context: clip_index 0 does not load a file.")
+            # indexed slots use the natural name: clip 2 lives in
+            # *_00002.safetensors. Auto-mode files carry a trailing
+            # underscore (*_00002_.safetensors) and are deliberately
+            # NOT matched: their numbers count runs, not clips, so a
+            # reject could be sitting in any of them.
+            endings = ("_%05d.safetensors" % idx,
+                       "_clip%03d.safetensors" % idx)  # older versions
+            files = [os.path.join(c, f) for f in os.listdir(c)
+                     if f.endswith(endings)]
+            if not files:
+                near = [f for f in os.listdir(c)
+                        if f.endswith("_%05d_.safetensors" % idx)]
+                hint = ""
+                if near:
+                    hint = (" Found %s, which is an auto-numbered save "
+                            "(trailing underscore = numbered by RUN, so "
+                            "it may be a reject). If it really is clip "
+                            "%d, rename it to drop the trailing "
+                            "underscore: %s" %
+                            (near[0], idx,
+                             near[0].replace("_%05d_" % idx,
+                                             "_%05d" % idx)))
+                raise FileNotFoundError(
+                    "h3_motion_context: no saved latent for clip %d "
+                    "(no *_%05d.safetensors in %s).%s"
+                    % (idx, idx, c, hint))
             return max(files, key=os.path.getmtime)
     raise FileNotFoundError(
         "h3_motion_context: %r is neither a file nor a folder (also tried "
         "relative to the ComfyUI output directory)." % p)
+
+
+def _write_safetensors(path, tensors):
+    # safetensors load_file memory-maps on Windows. Overwriting a mapped
+    # slot (re-roll, or Load 0 aimed at the file Save is about to replace)
+    # fails with os error 1224. Write a sibling temp file and replace.
+    tmp = path + ".tmp"
+    try:
+        _st_save(tensors, tmp,
+                 metadata={"format": "h3_motion_context_av_v1"})
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            gc.collect()
+            os.replace(tmp, path)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 class MiniMaxH3MotionContextSaveLatent:
@@ -901,14 +909,15 @@ class MiniMaxH3MotionContextSaveLatent:
                                "folder so the Load node can always pick "
                                "the newest."}),
                 "clip_index": ("INT", {
-                    "default": 0, "min": 0, "max": 9999,
+                    "default": 1, "min": 0, "max": 9999, "step": 1,
                     "tooltip": "Which clip of the chain THIS is. Saves to "
                                "that clip's fixed slot, so a re-roll "
                                "overwrites its own reject instead of "
-                               "stacking new files. Generating clip 2: "
-                               "set 2 here and 1 on the Load node. 0 = "
-                               "old behaviour, a new numbered file every "
-                               "run (numbers count runs, not clips)."}),
+                               "stacking new files. First clip: 1 here "
+                               "and 0 on the Load node. Clip 2: 2 here "
+                               "and 1 on the Load node. 0 = old behaviour, "
+                               "a new numbered file every run (numbers "
+                               "count runs, not clips)."}),
             },
         }
 
@@ -945,8 +954,7 @@ class MiniMaxH3MotionContextSaveLatent:
         else:
             path = os.path.join(folder, "%s_%05d_.safetensors"
                                 % (filename, counter))
-        _st_save({"video": video, "audio": audio}, path,
-                 metadata={"format": "h3_motion_context_av_v1"})
+        _write_safetensors(path, {"video": video, "audio": audio})
         _LOG.info("h3_motion_context: saved AV latent to %s (video %s, "
                   "audio %s)", path, tuple(video.shape), tuple(audio.shape))
         return (path,)
@@ -957,13 +965,15 @@ class MiniMaxH3MotionContextLoadLatent:
 
     clip_index means exactly what it says: set it to the clip you want to
     CONTINUE FROM, and that clip's slot is loaded. Generating clip 2 from
-    clip 1: Load node 1, Save node 2. Re-rolling clip 2 changes nothing --
-    it reloads slot 1 and overwrites slot 2's reject. Accept, then bump
-    both numbers.
+    clip 1: Load node 1, Save node 2. Use H3 Motion Context Chain to
+    advance the pair and queue: Approve walks forward, Run/Re-roll stays
+    on the current slot (use it instead of ComfyUI's Run), Chain keeps
+    going from the current indices, Reset sets Load 0 / Save 1. All three
+    nodes must sit in the same canvas group.
 
-    At 0 it loads the newest file in the folder instead. Simple, but NOT
-    retry-safe: a re-roll's newest file is the rejected attempt's own
-    save, so the retry gets conditioned on the audio you just rejected.
+    At 0 there is no previous clip: the loader returns nothing and Motion
+    Context passes the conditioning through. First clip of a chain is
+    Load 0 / Save 1, then Load 1 / Save 2, and so on.
 
     The output is ONLY for the Motion Context node's context_latent input.
     It is not a decodable latent -- do not wire it into VAE decode.
@@ -978,16 +988,16 @@ class MiniMaxH3MotionContextLoadLatent:
                     "tooltip": "A saved latent file, or a folder (relative "
                                "paths resolve against the ComfyUI output "
                                "directory). Pointing at a specific FILE "
-                               "always loads that file, ignoring "
-                               "clip_index."}),
+                               "always loads that file when clip_index "
+                               "is greater than 0, ignoring the index. "
+                               "clip_index 0 never reads a file."}),
                 "clip_index": ("INT", {
-                    "default": 0, "min": 0, "max": 9999,
+                    "default": 0, "min": 0, "max": 9999, "step": 1,
                     "tooltip": "The clip to CONTINUE FROM: that clip's "
-                               "slot is loaded. Generating clip 2 from "
-                               "clip 1: set 1 here and 2 on the Save "
-                               "node. 0 = newest file in the folder "
-                               "(NOT retry-safe: a re-roll loads its own "
-                               "rejected audio)."}),
+                               "slot is loaded. First clip: 0 here and 1 "
+                               "on the Save node (nothing is loaded). "
+                               "Clip 2 from clip 1: 1 here and 2 on the "
+                               "Save node."}),
             },
         }
 
@@ -1000,16 +1010,20 @@ class MiniMaxH3MotionContextLoadLatent:
     @classmethod
     def IS_CHANGED(cls, latent_path, clip_index=0):
         # the path string stays constant while the file behind it changes
-        # (newest save, or an overwritten slot), so cache on the resolved
-        # file identity instead -- otherwise ComfyUI would happily serve
-        # a stale latent forever
+        # (an overwritten slot), so cache on the resolved file identity
+        # instead -- otherwise ComfyUI would happily serve a stale latent
+        # forever. Index 0 never reads a file.
+        if int(clip_index) <= 0:
+            return "disabled"
         try:
             p = _resolve_latent_path(latent_path, clip_index)
-            return "%s:%d" % (p, os.stat(p).st_mtime_ns)
+            return "%s:%d:owned" % (p, os.stat(p).st_mtime_ns)
         except Exception:
             return float("NaN")  # unresolvable: never cache
 
     def load(self, latent_path, clip_index=0):
+        if int(clip_index) <= 0:
+            return (None,)
         if _st_load is None:
             raise RuntimeError("h3_motion_context: safetensors is not "
                                "available; cannot load latents.")
@@ -1020,11 +1034,42 @@ class MiniMaxH3MotionContextLoadLatent:
                 "h3_motion_context: %s is not an h3_motion_context latent "
                 "(missing video/audio streams). Was it saved by the stock "
                 "Save Latent node instead?" % path)
+        # copy off the mmap so a later Save can overwrite this slot on Windows
+        video = data.pop("video").contiguous().clone()
+        audio = data.pop("audio").contiguous().clone()
         _LOG.info("h3_motion_context: loaded AV latent from %s", path)
         # a plain list, not a NestedTensor: only this repo's context_latent
         # input accepts it, which is the point -- it cannot be mistaken
         # for a decodable latent without failing loudly downstream
-        return ({"samples": [data["video"], data["audio"]]},)
+        return ({"samples": [video, audio]},)
+
+
+class MiniMaxH3MotionContextChain:
+    """Approve, Run/Re-roll, auto-chain, or reset Load/Save clip_index.
+
+    Load, Save, and this node must sit in the same canvas group or the
+    buttons do nothing. Run-on-change fires once per widget, so two
+    incrementing indices queue two prompts and skip slots. This node
+    advances the pair, then queues once. Frontend-only; execute is a no-op.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    RETURN_TYPES = ()
+    FUNCTION = "noop"
+    OUTPUT_NODE = True
+    CATEGORY = "conditioning/minimax"
+    DESCRIPTION = ("Approve advances Load/Save and runs the next clip. "
+                   "Run/Re-roll queues the current slot (use this instead "
+                   "of ComfyUI's Run). Chain queues the current slot and "
+                   "auto-approves after each success. Reset sets Load 0 / "
+                   "Save 1 without queuing. Load, Save, and this node must "
+                   "sit in the same canvas group or the buttons do nothing.")
+
+    def noop(self):
+        return ()
 
 
 NODE_CLASS_MAPPINGS = {
@@ -1032,10 +1077,12 @@ NODE_CLASS_MAPPINGS = {
     "MiniMaxH3MotionContextTrim": MiniMaxH3MotionContextTrim,
     "MiniMaxH3MotionContextSaveLatent": MiniMaxH3MotionContextSaveLatent,
     "MiniMaxH3MotionContextLoadLatent": MiniMaxH3MotionContextLoadLatent,
+    "MiniMaxH3MotionContextChain": MiniMaxH3MotionContextChain,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3MotionContext": "H3 Motion Context",
     "MiniMaxH3MotionContextTrim": "H3 Motion Context Trim",
     "MiniMaxH3MotionContextSaveLatent": "H3 Motion Context Save Latent",
     "MiniMaxH3MotionContextLoadLatent": "H3 Motion Context Load Latent",
+    "MiniMaxH3MotionContextChain": "H3 Motion Context Chain",
 }
