@@ -649,6 +649,26 @@ def main():
     print("indexed slots: re-roll overwrites its slot, loads previous "
           "clip's latent; auto mode confirmed to return the reject")
 
+    import shutil
+    import tempfile
+    td = tempfile.mkdtemp()
+    try:
+        open(os.path.join(td, "clip_00001.safetensors"), "wb").close()
+        open(os.path.join(td, "clip_00002.safetensors"), "wb").close()
+        open(os.path.join(td, "hero_take.safetensors"), "wb").close()
+        open(os.path.join(td, "keep_me.txt"), "w").write("x")
+        assert nodes._clip_slot_exists(td, 1)
+        assert nodes._clip_slot_exists(td, 2)
+        assert not nodes._clip_slot_exists(td, 3)
+        n = nodes._clear_clip_slots(td)
+        assert n == 2, n
+        assert not nodes._clip_slot_exists(td, 1)
+        assert os.path.exists(os.path.join(td, "keep_me.txt"))
+        assert os.path.exists(os.path.join(td, "hero_take.safetensors"))
+    finally:
+        shutil.rmtree(td)
+    print("reset clear: numbered slots gone, custom names left alone")
+
     print("smoke test passed")
 
 

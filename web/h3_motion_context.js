@@ -86,12 +86,55 @@ function readClip(node) {
   return (clipWidget(node)?.value | 0) || 0;
 }
 
+function widgetValue(node, name) {
+  return node?.widgets?.find((w) => w.name === name)?.value;
+}
+
+function loadPath(pair) {
+  const p = widgetValue(pair.load, "latent_path");
+  return (p == null || p === "") ? "h3_context" : p;
+}
+
+async function firstClipExists(pair) {
+  try {
+    const r = await api.fetchApi("/h3_motion_context/slot_exists", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ latent_path: loadPath(pair), clip_index: 1 }),
+    });
+    if (!r.ok) return false;
+    const j = await r.json();
+    return !!j.exists;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function clearLatents(pair) {
+  try {
+    const r = await api.fetchApi("/h3_motion_context/clear_latents", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ latent_path: loadPath(pair) }),
+    });
+    if (!r.ok) return 0;
+    const j = await r.json();
+    return j.removed | 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
 function writeClip(node, value) {
   const w = clipWidget(node);
   if (!w) return false;
   const next = Math.max(0, Math.min(MAX, value | 0));
   w.value = next;
   return true;
+}
+
+function readSegments(ctrl) {
+  return Math.max(0, widgetValue(ctrl, "segments") | 0);
 }
 
 function paint(ctrl) {
@@ -104,9 +147,14 @@ function paint(ctrl) {
   }
   const a = readClip(pair.load);
   const b = readClip(pair.save);
-  meta.textContent = ctrl._h3mc.chaining
-    ? `Chaining  Load ${a} / Save ${b}`
-    : `Load ${a} / Save ${b}`;
+  const left = ctrl._h3mc.remaining | 0;
+  if (ctrl._h3mc.chaining) {
+    meta.textContent = left
+      ? `Chaining  Load ${a} / Save ${b}  ·  ${left} left`
+      : `Chaining  Load ${a} / Save ${b}`;
+  } else {
+    meta.textContent = `Load ${a} / Save ${b}`;
+  }
   const chainBtn = ctrl._h3mc.chainBtn;
   if (chainBtn) {
     chainBtn.textContent = ctrl._h3mc.chaining ? "Stop" : "Chain";
@@ -120,6 +168,7 @@ function stopChain(ctrl) {
   if (ctrl) {
     ctrl._h3mc.chaining = false;
     ctrl._h3mc.awaiting = false;
+    ctrl._h3mc.remaining = 0;
     paint(ctrl);
   }
   if (live === ctrl) live = null;
@@ -148,6 +197,21 @@ function resetFirst(ctrl) {
   return true;
 }
 
+async function startChain(ctrl) {
+  const pair = findPair(ctrl);
+  if (!pair) return false;
+  const load = readClip(pair.load);
+  const save = readClip(pair.save);
+  const atFirst = load === 0 && save <= 1;
+  if (atFirst && !(await firstClipExists(pair))) {
+    await queueOnce(ctrl);
+    return true;
+  }
+  if (!advance(ctrl)) return false;
+  await queueOnce(ctrl);
+  return true;
+}
+
 async function queueOnce(ctrl) {
   const pair = findPair(ctrl);
   if (!pair) return;
@@ -168,6 +232,16 @@ function onPromptDone(ok) {
     live = null;
     paint(ctrl);
     return;
+  }
+  const left = ctrl._h3mc.remaining | 0;
+  if (left > 0) {
+    ctrl._h3mc.remaining = left - 1;
+    if (ctrl._h3mc.remaining === 0) {
+      ctrl._h3mc.chaining = false;
+      live = null;
+      paint(ctrl);
+      return;
+    }
   }
   if (!advance(ctrl)) {
     stopChain(ctrl);
@@ -194,6 +268,8 @@ app.registerExtension({
       row.className = "h3mc-chain-row";
       const row2 = document.createElement("div");
       row2.className = "h3mc-chain-row";
+      const row3 = document.createElement("div");
+      row3.className = "h3mc-chain-row";
       const approve = document.createElement("button");
       approve.textContent = "Approve";
       approve.title = "Advance Load/Save, then run the next clip.";
@@ -202,18 +278,22 @@ app.registerExtension({
       reroll.title = "Queue at the current Load/Save indices. Use this instead of ComfyUI's Run button.";
       const chainBtn = document.createElement("button");
       chainBtn.textContent = "Chain";
-      chainBtn.title = "Queue at the current Load/Save indices, then auto-approve after each success.";
+      chainBtn.title = "Approve on a loop. segments > 0 stops after that many clips; 0 runs until Stop.";
       const resetBtn = document.createElement("button");
       resetBtn.textContent = "Reset";
-      resetBtn.title = "Set Load 0 / Save 1. Does not queue.";
+      resetBtn.title = "Set Load 0 / Save 1. Does not queue or delete files.";
+      const clearBtn = document.createElement("button");
+      clearBtn.textContent = "Clear latents";
+      clearBtn.title = "Delete numbered chain slots (clip_00001.safetensors and so on). Custom filenames are left alone. Does not change indices or queue.";
       row.append(approve, reroll);
       row2.append(chainBtn, resetBtn);
+      row3.append(clearBtn);
       const meta = document.createElement("div");
       meta.className = "h3mc-chain-meta";
-      root.append(row, row2, meta);
+      root.append(row, row2, row3, meta);
       swallow(root);
       this.addDOMWidget("h3mc_chain", "CHAIN", root, { serialize: false });
-      this._h3mc = { chaining: false, awaiting: false, meta, chainBtn };
+      this._h3mc = { chaining: false, awaiting: false, remaining: 0, meta, chainBtn };
       approve.onclick = async (e) => {
         e.stopPropagation();
         if (this._h3mc.awaiting) return;
@@ -239,8 +319,9 @@ app.registerExtension({
           return;
         }
         this._h3mc.chaining = true;
+        this._h3mc.remaining = readSegments(this);
         paint(this);
-        await queueOnce(this);
+        if (!await startChain(this)) stopChain(this);
       };
       resetBtn.onclick = (e) => {
         e.stopPropagation();
@@ -248,8 +329,24 @@ app.registerExtension({
         stopChain(this);
         resetFirst(this);
       };
+      clearBtn.onclick = async (e) => {
+        e.stopPropagation();
+        if (this._h3mc.awaiting || this._h3mc.chaining) return;
+        const pair = findPair(this);
+        if (!pair) {
+          paint(this);
+          return;
+        }
+        const n = await clearLatents(pair);
+        paint(this);
+        if (this._h3mc?.meta) {
+          this._h3mc.meta.textContent = n
+            ? `Removed ${n} numbered slot${n === 1 ? "" : "s"}. Custom names kept.`
+            : "No numbered chain slots to remove.";
+        }
+      };
       paint(this);
-      this.setSize?.([270, 128]);
+      this.setSize?.([270, 168]);
       return r;
     };
   },

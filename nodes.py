@@ -32,6 +32,7 @@ anchor_mode
 import gc
 import logging
 import os
+import re
 
 import comfy.utils
 import folder_paths
@@ -864,6 +865,79 @@ def _resolve_latent_path(path, clip_index=0):
         "relative to the ComfyUI output directory)." % p)
 
 
+def _latent_folder(path):
+    """Directory that holds this chain's slot files, or None."""
+    p = (path or "").strip().strip('"').strip("'") or "h3_context"
+    for c in (p, os.path.join(folder_paths.get_output_directory(), p)):
+        if os.path.isdir(c):
+            return c
+        if os.path.isfile(c):
+            return os.path.dirname(c)
+    return None
+
+
+def _clip_slot_exists(latent_path, clip_index=1):
+    try:
+        _resolve_latent_path(latent_path, int(clip_index))
+        return True
+    except FileNotFoundError:
+        return False
+
+
+_CHAIN_SLOT_FILE = re.compile(
+    r"(?:_\d{5}|_\d{5}_|_clip\d{3})\.safetensors(?:\.tmp)?$"
+)
+
+
+def _clear_clip_slots(latent_path):
+    """Delete numbered chain slots. Custom filenames are left alone."""
+    folder = _latent_folder(latent_path)
+    if not folder:
+        return 0
+    removed = 0
+    for name in os.listdir(folder):
+        if not _CHAIN_SLOT_FILE.search(name):
+            continue
+        fp = os.path.join(folder, name)
+        try:
+            os.remove(fp)
+        except OSError:
+            gc.collect()
+            os.remove(fp)
+        removed += 1
+    if removed:
+        _LOG.info("h3_motion_context: cleared %d chain slot(s) from %s",
+                  removed, folder)
+    return removed
+
+
+def register_chain_routes():
+    """POST slot_exists / clear_latents for the Chain node's start and Clear."""
+    try:
+        from aiohttp import web
+        from server import PromptServer
+    except ImportError:
+        return
+    server = getattr(PromptServer, "instance", None)
+    if server is None or getattr(register_chain_routes, "_done", False):
+        return
+
+    @server.routes.post("/h3_motion_context/slot_exists")
+    async def _slot_exists_route(request):
+        data = await request.json()
+        exists = _clip_slot_exists(data.get("latent_path") or "h3_context",
+                                   int(data.get("clip_index") or 1))
+        return web.json_response({"exists": exists})
+
+    @server.routes.post("/h3_motion_context/clear_latents")
+    async def _clear_latents_route(request):
+        data = await request.json()
+        n = _clear_clip_slots(data.get("latent_path") or "h3_context")
+        return web.json_response({"removed": n})
+
+    register_chain_routes._done = True
+
+
 def _write_safetensors(path, tensors):
     # safetensors load_file memory-maps on Windows. Overwriting a mapped
     # slot (re-roll, or Load 0 aimed at the file Save is about to replace)
@@ -967,9 +1041,10 @@ class MiniMaxH3MotionContextLoadLatent:
     CONTINUE FROM, and that clip's slot is loaded. Generating clip 2 from
     clip 1: Load node 1, Save node 2. Use H3 Motion Context Chain to
     advance the pair and queue: Approve walks forward, Run/Re-roll stays
-    on the current slot (use it instead of ComfyUI's Run), Chain keeps
-    going from the current indices, Reset sets Load 0 / Save 1. All three
-    nodes must sit in the same canvas group.
+    on the current slot (use it instead of ComfyUI's Run), Chain is
+    Approve on a loop (at 0/1 with no clip 1 yet it generates that
+    first), Reset sets Load 0 / Save 1, Clear latents deletes numbered
+    slots. All three nodes must sit in the same canvas group.
 
     At 0 there is no previous clip: the loader returns nothing and Motion
     Context passes the conditioning through. First clip of a chain is
@@ -1045,17 +1120,28 @@ class MiniMaxH3MotionContextLoadLatent:
 
 
 class MiniMaxH3MotionContextChain:
-    """Approve, Run/Re-roll, auto-chain, or reset Load/Save clip_index.
+    """Approve, Run/Re-roll, auto-chain, reset indices, or clear slots.
 
     Load, Save, and this node must sit in the same canvas group or the
-    buttons do nothing. Run-on-change fires once per widget, so two
-    incrementing indices queue two prompts and skip slots. This node
-    advances the pair, then queues once. Frontend-only; execute is a no-op.
+    buttons do nothing. Chain is Approve on a loop. At Load 0 / Save 1
+    with no clip 1 on disk it generates that first clip instead of
+    advancing into a missing file. segments > 0 stops Chain after that
+    many clips; 0 keeps going until Stop. Reset only sets 0/1. Clear
+    latents deletes numbered chain slots, not custom filenames.
+    Execute is a no-op; the buttons and two HTTP routes do the work.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {}}
+        return {
+            "required": {
+                "segments": ("INT", {
+                    "default": 0, "min": 0, "max": 9999, "step": 1,
+                    "tooltip": "How many clips Chain generates before it "
+                               "stops. 0 keeps going until you click Stop."
+                }),
+            },
+        }
 
     RETURN_TYPES = ()
     FUNCTION = "noop"
@@ -1063,12 +1149,15 @@ class MiniMaxH3MotionContextChain:
     CATEGORY = "conditioning/minimax"
     DESCRIPTION = ("Approve advances Load/Save and runs the next clip. "
                    "Run/Re-roll queues the current slot (use this instead "
-                   "of ComfyUI's Run). Chain queues the current slot and "
-                   "auto-approves after each success. Reset sets Load 0 / "
-                   "Save 1 without queuing. Load, Save, and this node must "
-                   "sit in the same canvas group or the buttons do nothing.")
+                   "of ComfyUI's Run). Chain is Approve on a loop; at "
+                   "Load 0 / Save 1 with no clip 1 saved it generates "
+                   "clip 1 first. segments is how many clips Chain runs "
+                   "before stopping (0 = until Stop). Reset sets Load 0 / "
+                   "Save 1. Clear latents deletes numbered chain slots. "
+                   "Load, Save, and this node must sit in the same canvas "
+                   "group or the buttons do nothing.")
 
-    def noop(self):
+    def noop(self, segments=0):
         return ()
 
 

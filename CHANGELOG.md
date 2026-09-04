@@ -8,6 +8,17 @@ rejected any keyframe anchor other than the first or last frame. That
 landed in ComfyUI 0.34.0. Every release through 0.33.4 has the older
 layout. Each entry below says which of the two it works with.
 
+## 0.6.0 - 2026-09-03
+
+Requires ComfyUI 0.34.0 or newer. Use 0.3.1 on anything older.
+
+- Chain is Approve on a loop: it advances Load/Save, then queues, then
+  keeps going. At Load 0 / Save 1 with no clip 1 on disk it generates
+  that first clip instead of walking into a missing file. `segments` is
+  how many clips that loop runs (0 = until Stop). Reset sets 0/1 and
+  does not delete files. Clear latents deletes numbered chain slots;
+  custom filenames are left alone.
+
 ## 0.5.1 - 2026-09-02
 
 Requires ComfyUI 0.34.0 or newer. Use 0.3.1 on anything older.

@@ -25,7 +25,11 @@ that works with 0.33.4 and older.
 
 import logging
 
-from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from .nodes import (
+    NODE_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS,
+    register_chain_routes,
+)
 from .probe_node import (
     NODE_CLASS_MAPPINGS as _PROBE_CLASSES,
     NODE_DISPLAY_NAME_MAPPINGS as _PROBE_NAMES,
@@ -33,6 +37,7 @@ from .probe_node import (
 
 NODE_CLASS_MAPPINGS.update(_PROBE_CLASSES)
 NODE_DISPLAY_NAME_MAPPINGS.update(_PROBE_NAMES)
+register_chain_routes()
 
 logging.getLogger("h3_motion_context").info(
     "h3_motion_context: nodes registered. ComfyUI is not modified; the "

@@ -126,11 +126,17 @@ Motion Context group).
   Load 0 / Save 1 and click it. Hate the result? Click it again; the
   retry overwrites that slot.
 - **Approve** advances both indices, then queues the next clip once.
-- **Chain** queues at the current Load/Save indices and auto-approves
-  after each successful run. It does not reset the pair first, so you
-  can walk a few clips by hand and then let it take over. Click **Stop**
-  (the same button) to halt the next queue.
-- **Reset** sets Load 0 / Save 1. It does not queue.
+- **Chain** is Approve on a loop. After a finished clip it bumps
+  Load/Save and keeps going, so a 0/1 clip you already made becomes 1/2
+  rather than a re-roll. The exception is Load 0 / Save 1 with no clip 1
+  on disk: it generates that first clip, then auto-approves. **segments**
+  is how many clips that loop runs: 5 means five clips then stop, 0 means
+  keep going until you click **Stop**.
+- **Reset** sets Load 0 / Save 1. It does not queue and does not delete
+  files.
+- **Clear latents** deletes numbered chain slots
+  (`clip_00001.safetensors` and so on) in the Load folder. Files you
+  renamed are left alone. Indices stay put.
 
 Files are named the obvious way, `clip_00002.safetensors` is clip 2.
 
