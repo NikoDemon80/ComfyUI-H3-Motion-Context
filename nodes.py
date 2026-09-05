@@ -811,68 +811,88 @@ class MiniMaxH3MotionContextTrim:
         return (out_images, out_audio)
 
 
-def _resolve_latent_path(path, clip_index=0):
-    """Turn the loader's path input into a concrete file.
+def _under_output(path):
+    """Resolve `path` inside ComfyUI's output folder. None if it would escape.
 
-    Accepts an absolute path, a path relative to ComfyUI's output folder,
-    or a directory (in either form). For a directory, clip_index must be
-    a positive slot: clip 1 is *_00001.safetensors. Auto-mode files carry
-    a trailing underscore (*_00001_.safetensors) and are never matched,
-    because their numbers count runs and could hold a reject. clip_index 0
-    is handled by the Load node itself (no file, first clip).
+    Absolute paths are allowed only when they already live under output/.
+    Relative paths join onto output/. This is what keeps latent_path from
+    becoming an arbitrary file read or a delete-anywhere on Clear.
     """
-    p = (path or "").strip().strip('"').strip("'")
-    if not p:
-        p = "h3_context"
-    candidates = [p, os.path.join(folder_paths.get_output_directory(), p)]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-        if os.path.isdir(c):
-            idx = int(clip_index)
-            if idx <= 0:
-                raise FileNotFoundError(
-                    "h3_motion_context: clip_index 0 does not load a file.")
-            # indexed slots use the natural name: clip 2 lives in
-            # *_00002.safetensors. Auto-mode files carry a trailing
-            # underscore (*_00002_.safetensors) and are deliberately
-            # NOT matched: their numbers count runs, not clips, so a
-            # reject could be sitting in any of them.
-            endings = ("_%05d.safetensors" % idx,
-                       "_clip%03d.safetensors" % idx)  # older versions
-            files = [os.path.join(c, f) for f in os.listdir(c)
-                     if f.endswith(endings)]
-            if not files:
-                near = [f for f in os.listdir(c)
-                        if f.endswith("_%05d_.safetensors" % idx)]
-                hint = ""
-                if near:
-                    hint = (" Found %s, which is an auto-numbered save "
-                            "(trailing underscore = numbered by RUN, so "
-                            "it may be a reject). If it really is clip "
-                            "%d, rename it to drop the trailing "
-                            "underscore: %s" %
-                            (near[0], idx,
-                             near[0].replace("_%05d_" % idx,
-                                             "_%05d" % idx)))
-                raise FileNotFoundError(
-                    "h3_motion_context: no saved latent for clip %d "
-                    "(no *_%05d.safetensors in %s).%s"
-                    % (idx, idx, c, hint))
-            return max(files, key=os.path.getmtime)
+    root = os.path.realpath(folder_paths.get_output_directory())
+    p = (path or "").strip().strip('"').strip("'") or "h3_context"
+    resolved = os.path.realpath(p if os.path.isabs(p) else os.path.join(root, p))
+    if resolved != root and not resolved.startswith(root + os.sep):
+        return None
+    return resolved
+
+
+def _resolve_latent_path(path, clip_index=0):
+    """Turn the loader's path input into a concrete file under output/.
+
+    Accepts a path relative to ComfyUI's output folder, an absolute path
+    that already lives there, or a directory in either form. For a
+    directory, clip_index must be a positive slot: clip 1 is
+    *_00001.safetensors. Auto-mode files carry a trailing underscore
+    (*_00001_.safetensors) and are never matched, because their numbers
+    count runs and could hold a reject. clip_index 0 is handled by the
+    Load node itself (no file, first clip).
+    """
+    c = _under_output(path)
+    if not c:
+        raise FileNotFoundError(
+            "h3_motion_context: path must stay inside the ComfyUI output folder.")
+    if os.path.isfile(c):
+        return c
+    if os.path.isdir(c):
+        idx = int(clip_index)
+        if idx <= 0:
+            raise FileNotFoundError(
+                "h3_motion_context: clip_index 0 does not load a file.")
+        # indexed slots use the natural name: clip 2 lives in
+        # *_00002.safetensors. Auto-mode files carry a trailing
+        # underscore (*_00002_.safetensors) and are deliberately
+        # NOT matched: their numbers count runs, not clips, so a
+        # reject could be sitting in any of them.
+        endings = ("_%05d.safetensors" % idx,
+                   "_clip%03d.safetensors" % idx)  # older versions
+        files = [os.path.join(c, f) for f in os.listdir(c)
+                 if f.endswith(endings)]
+        if not files:
+            near = [f for f in os.listdir(c)
+                    if f.endswith("_%05d_.safetensors" % idx)]
+            hint = ""
+            if near:
+                hint = (" Found %s, which is an auto-numbered save "
+                        "(trailing underscore = numbered by RUN, so "
+                        "it may be a reject). If it really is clip "
+                        "%d, rename it to drop the trailing "
+                        "underscore: %s" %
+                        (near[0], idx,
+                         near[0].replace("_%05d_" % idx,
+                                         "_%05d" % idx)))
+            raise FileNotFoundError(
+                "h3_motion_context: no saved latent for clip %d "
+                "(no *_%05d.safetensors in %s).%s"
+                % (idx, idx, c, hint))
+        return max(files, key=os.path.getmtime)
     raise FileNotFoundError(
-        "h3_motion_context: %r is neither a file nor a folder (also tried "
-        "relative to the ComfyUI output directory)." % p)
+        "h3_motion_context: %r is neither a file nor a folder under the "
+        "ComfyUI output directory." % ((path or "").strip() or "h3_context"))
 
 
 def _latent_folder(path):
-    """Directory that holds this chain's slot files, or None."""
-    p = (path or "").strip().strip('"').strip("'") or "h3_context"
-    for c in (p, os.path.join(folder_paths.get_output_directory(), p)):
-        if os.path.isdir(c):
-            return c
-        if os.path.isfile(c):
-            return os.path.dirname(c)
+    """Directory that holds this chain's slot files, or None.
+
+    Refuses anything outside ComfyUI's output folder so Clear cannot
+    delete numbered safetensors elsewhere on disk.
+    """
+    c = _under_output(path)
+    if not c:
+        return None
+    if os.path.isdir(c):
+        return c
+    if os.path.isfile(c):
+        return os.path.dirname(c)
     return None
 
 
@@ -922,7 +942,10 @@ def register_chain_routes():
     if server is None or getattr(register_chain_routes, "_done", False):
         return
 
+    from .csrf_guard import require_same_origin
+
     @server.routes.post("/h3_motion_context/slot_exists")
+    @require_same_origin
     async def _slot_exists_route(request):
         data = await request.json()
         exists = _clip_slot_exists(data.get("latent_path") or "h3_context",
@@ -930,6 +953,7 @@ def register_chain_routes():
         return web.json_response({"exists": exists})
 
     @server.routes.post("/h3_motion_context/clear_latents")
+    @require_same_origin
     async def _clear_latents_route(request):
         data = await request.json()
         n = _clear_clip_slots(data.get("latent_path") or "h3_context")

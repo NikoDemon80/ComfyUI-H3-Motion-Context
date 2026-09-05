@@ -6,7 +6,6 @@ Clip A goes in as a latent, so the fake audio VAE's decode is what the
 node reads, exactly as it would in a graph.
 """
 
-import importlib
 import os
 import sys
 import types
@@ -16,7 +15,6 @@ import numpy as np
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PKG_DIR = os.path.dirname(_TESTS_DIR)
 sys.path.insert(0, _TESTS_DIR)
-sys.path.insert(0, os.path.dirname(_PKG_DIR))
 
 from _mock_harness import make_mm, make_torch  # noqa: E402
 
@@ -68,8 +66,13 @@ def _install_fakes():
 
 
 _install_fakes()
-probe_node = importlib.import_module(
-    "%s.probe_node" % os.path.basename(_PKG_DIR))
+# Relative imports (from .nodes) need a package. The folder name has
+# hyphens, so a stub name is used instead of a dynamic import.
+_pkg = types.ModuleType("h3mc_pkg")
+_pkg.__path__ = [_PKG_DIR]
+_pkg.__file__ = os.path.join(_PKG_DIR, "__init__.py")
+sys.modules["h3mc_pkg"] = _pkg
+import h3mc_pkg.probe_node as probe_node  # noqa: E402
 CORR_LIMIT = probe_node.CORR_CREDIBLE
 
 

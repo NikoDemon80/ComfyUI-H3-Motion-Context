@@ -1,0 +1,9 @@
+# Caches and local env only. tests/ ships with the pack (smoke test,
+# seam/level/freeze probes, mock harness). Do not blanket-ignore it.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.git/
+.github/
+.cursor/

@@ -48,7 +48,6 @@ Checks:
      checks and does not fail silently either
 """
 
-import importlib
 import os
 import sys
 import types
@@ -272,7 +271,8 @@ def load_contract(mm):
     sys.modules["comfy.ldm.minimax"].model = mm
     sys.modules["torch"] = make_torch()
     sys.modules.pop("layout_contract", None)
-    return importlib.import_module("layout_contract")
+    import layout_contract
+    return layout_contract
 
 
 def _refused(mm, label, expect):
