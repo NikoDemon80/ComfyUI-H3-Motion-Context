@@ -234,10 +234,10 @@
         "Node name for S&R": "MiniMaxH3MotionContextChain"
       },
       "widgets_values": [
-        ""
+        0
       ],
       "widgets_values_named": {
-        "h3mc_chain": ""
+        "segments": 0
       },
       "color": "#1f1f48",
       "bgcolor": "rgba(24,24,27,.9)"
@@ -1362,10 +1362,10 @@
         "Node name for S&R": "MiniMaxH3MotionContextChain"
       },
       "widgets_values": [
-        ""
+        0
       ],
       "widgets_values_named": {
-        "h3mc_chain": ""
+        "segments": 0
       },
       "color": "#1f1f48",
       "bgcolor": "rgba(24,24,27,.9)"

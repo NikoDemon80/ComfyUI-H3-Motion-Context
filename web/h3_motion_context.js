@@ -133,8 +133,36 @@ function writeClip(node, value) {
   return true;
 }
 
+function coerceSegments(node) {
+  const w = node?.widgets?.find((x) => x.name === "segments");
+  if (!w) return 0;
+  const n = parseInt(w.value, 10);
+  const v = Number.isFinite(n) && n >= 0 ? n : 0;
+  w.value = v;
+  return v;
+}
+
+function wireSegments(node) {
+  const w = node?.widgets?.find((x) => x.name === "segments");
+  if (!w || w._h3mcSeg) return;
+  w._h3mcSeg = true;
+  const prev = w.serializeValue?.bind(w);
+  w.serializeValue = async function (n, i) {
+    if (prev) {
+      try { await prev(n, i); } catch (e) { /* keep coercing */ }
+    }
+    return coerceSegments(node);
+  };
+  const prevCb = w.callback;
+  w.callback = function () {
+    coerceSegments(node);
+    return prevCb?.apply(this, arguments);
+  };
+  coerceSegments(node);
+}
+
 function readSegments(ctrl) {
-  return Math.max(0, widgetValue(ctrl, "segments") | 0);
+  return coerceSegments(ctrl);
 }
 
 function paint(ctrl) {
@@ -261,6 +289,7 @@ app.registerExtension({
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const r = onNodeCreated?.apply(this, arguments);
+      wireSegments(this);
       injectCss();
       const root = document.createElement("div");
       root.className = "h3mc-chain";
@@ -347,6 +376,13 @@ app.registerExtension({
       };
       paint(this);
       this.setSize?.([270, 168]);
+      return r;
+    };
+    const onConfigure = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function () {
+      const r = onConfigure?.apply(this, arguments);
+      wireSegments(this);
+      coerceSegments(this);
       return r;
     };
   },
