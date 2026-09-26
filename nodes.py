@@ -1019,8 +1019,8 @@ class MiniMaxH3MotionContextSaveLatent:
             },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("latent_path",)
+    RETURN_TYPES = ("STRING","LATENT")
+    RETURN_NAMES = ("latent_path","path_through_latent")
     FUNCTION = "save"
     OUTPUT_NODE = True
     CATEGORY = "conditioning/minimax"
@@ -1055,7 +1055,7 @@ class MiniMaxH3MotionContextSaveLatent:
         _write_safetensors(path, {"video": video, "audio": audio})
         _LOG.info("h3_motion_context: saved AV latent to %s (video %s, "
                   "audio %s)", path, tuple(video.shape), tuple(audio.shape))
-        return (path,)
+        return (path,latent)
 
 
 class MiniMaxH3MotionContextLoadLatent:
